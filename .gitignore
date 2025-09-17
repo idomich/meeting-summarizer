@@ -1,28 +1,54 @@
-.idea
-*.pyc
-*.dia~
-*.DS_Store
-__pycache__
-.cache
-pip.conf
-.cache
-*.ipynb_checkpoints
-*.ipynb
-.run/*
-venv*
-.mypy_cache
-temp*
-/.coverage
-/coverage.xml
-/result.xml
-/.idea/
-/venv/
-.DS_Store
-/pip.conf
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.m4v
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.aac
+*.ogg
+*.m4a
+
+# Large data files
 *.zip
-/coverage.json
-cmg.py
-.envrc
-.cursor
-.history
+*.tar.gz
+*.rar
+
+# Environment files
+.envrc.backup
+.env.backup
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
 .vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
