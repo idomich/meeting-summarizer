@@ -18,9 +18,9 @@ GPT_MODEL_DISPLAY_NAME = "GPT-5 (high)"
 # Video file extensions that require conversion
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
 
-def refine_transcription_with_gpt(transcription: str, language_detected: str = None, meeting_description: str = None) -> str:
+def summarize_conversation_with_gpt(transcription: str, language_detected: str = None, meeting_description: str = None) -> str:
     """
-    Refine the transcription using GPT-4o to correct errors and improve readability
+    Summarize the conversation using GPT-5 to create a detailed summary preserving the flow of thinking
     
     Args:
         transcription: The raw transcription text from Whisper
@@ -28,47 +28,47 @@ def refine_transcription_with_gpt(transcription: str, language_detected: str = N
         meeting_description: Description of the meeting context (optional)
     
     Returns:
-        Refined transcription text
+        Detailed conversation summary
     """
     client = OpenAI()  # Will use OPENAI_API_KEY environment variable
     
     # Create meeting context section if description provided
     meeting_context = ""
     if meeting_description:
-        meeting_context = f"\n\nMeeting context: {meeting_description}\nPlease use this context to better understand technical terms, acronyms, and subject matter discussed. If names of participants are mentioned in the context, please identify and correctly attribute speakers in the transcription when possible."
+        meeting_context = f"\n\nMeeting context: {meeting_description}\nPlease use this context to better understand technical terms, acronyms, and subject matter discussed."
 
-    # Common prompt elements
-    prompt_header = "Check out this (not very good) transcription of a recorded conversation or meeting."
-    common_goals = "maintaining all technical details, context, and conversational tone"
-    speaker_instruction = "identify and attribute speakers by name when context allows"
-    
-    # Create task-specific instructions
+    # Language context for non-English audio
+    language_context = ""
     if language_detected and language_detected != 'en':
-        task_instruction = f"The original audio was detected as language '{language_detected}'. Please translate the conversation to English while properly smoothing out obvious transcription errors, maintaining the original context and meaning. When translating, also {speaker_instruction}."
-        output_request = f"Please provide a clean, readable English translation that maintains {common_goals}."
-    else:
-        refinement_tasks = [
-            "Correcting obvious transcription errors and mishearings",
-            "Improving grammar and sentence structure", 
-            "Maintaining all technical details and context",
-            "Keeping the conversational tone but making it more readable",
-            f"Identifying and attributing speakers by name when context allows",
-            "Preserving the original meaning and intent"
-        ]
-        task_instruction = "Please refine this transcription by:\n" + "\n".join(f"{i+1}. {task}" for i, task in enumerate(refinement_tasks))
-        output_request = f"Please provide a clean, readable version that maintains all details and context from the original."
+        language_context = f"\n\nNote: The original audio was in language '{language_detected}', so some transcription errors may be present due to automatic speech recognition."
+
+    # Summarization instructions
+    prompt_header = "You are tasked with creating a comprehensive summary of this conversation or meeting transcript."
+    
+    summarization_goals = [
+        "Create a detailed summary that captures all key points and important details discussed",
+        "Preserve the logical flow of thinking and progression of ideas throughout the conversation",
+        "Maintain all technical details, specific examples, numbers, and concrete information",
+        "Identify and attribute speakers by name when context allows",
+        "Organize the content logically while preserving the chronological flow of the discussion",
+        "Focus on substance and ideas rather than conversational style or atmosphere",
+        "Ensure no important information or insights are lost from the original conversation"
+    ]
+    
+    task_instruction = "Please create a comprehensive summary following these guidelines:\n" + "\n".join(f"{i+1}. {goal}" for i, goal in enumerate(summarization_goals))
+    output_request = "Please provide a detailed summary that preserves all important information and the flow of thinking, but presents it in a clear, organized manner without the conversational style."
     
     # Build the complete prompt
     prompt = f"""{prompt_header}
 
-{task_instruction}{meeting_context}
+{task_instruction}{meeting_context}{language_context}
 
-Original transcription:
+Original transcript:
 {transcription}
 
 {output_request}"""
 
-    print(f"Refining transcription with {GPT_MODEL_DISPLAY_NAME}...")
+    print(f"Summarizing conversation with {GPT_MODEL_DISPLAY_NAME}...")
     print("This may take a moment...")
     
     try:
@@ -77,7 +77,7 @@ Original transcription:
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are an expert at refining and improving transcriptions. Focus on clarity while preserving all technical details, context, and the original meaning of conversations."
+                    "content": "You are an expert at creating comprehensive summaries of conversations and meetings. Focus on preserving all important information, technical details, and the logical flow of ideas while presenting them in a clear, organized manner."
                 },
                 {
                     "role": "user", 
@@ -87,12 +87,12 @@ Original transcription:
             reasoning_effort="high",
         )
         
-        refined_text = response.choices[0].message.content
-        print(f"{GPT_MODEL_DISPLAY_NAME} refinement completed successfully!")
-        return refined_text
+        summary_text = response.choices[0].message.content
+        print(f"{GPT_MODEL_DISPLAY_NAME} summarization completed successfully!")
+        return summary_text
         
     except Exception as e:
-        print(f"Warning: {GPT_MODEL_DISPLAY_NAME} refinement failed: {e}")
+        print(f"Warning: {GPT_MODEL_DISPLAY_NAME} summarization failed: {e}")
         print("Returning original transcription...")
         return transcription
 
@@ -242,7 +242,7 @@ def process_audio_with_duration_limit(audio_file_path: str, max_duration_minutes
 
 def transcribe_audio(audio_file_path: str, output_file_path: str = None, model_size: str = DEFAULT_MODEL_SIZE, original_input_file: str = None, language: str = None, max_duration_minutes: float = None, use_gpt_refinement: bool = True, meeting_description: str = None) -> str:
     """
-    Transcribe audio file to text using Whisper
+    Transcribe audio file to text using Whisper and optionally create a detailed summary using GPT
     
     Args:
         audio_file_path: Path to the audio file (should be audio format, not video)
@@ -251,11 +251,11 @@ def transcribe_audio(audio_file_path: str, output_file_path: str = None, model_s
         original_input_file: Optional path to original input file (for display in output header)
         language: Language code (e.g., 'he', 'en'). If None, will auto-detect language
         max_duration_minutes: Optional maximum duration in minutes to transcribe
-        use_gpt_refinement: Whether to refine the transcription using GPT (default: True)
-        meeting_description: Optional description of the meeting context for better GPT refinement
+        use_gpt_refinement: Whether to create a summary of the transcription using GPT (default: True)
+        meeting_description: Optional description of the meeting context for better GPT summarization
     
     Returns:
-        Transcribed text (refined with GPT if enabled)
+        Transcribed text (summarized with GPT if enabled, otherwise raw transcription)
     """
     
     # Check if audio file exists
@@ -306,12 +306,12 @@ def transcribe_audio(audio_file_path: str, output_file_path: str = None, model_s
         # Extract the transcribed text
         transcribed_text = result["text"]
         
-        # Refine transcription with GPT if enabled
+        # Summarize conversation with GPT if enabled
         if use_gpt_refinement:
-            refined_text = refine_transcription_with_gpt(transcribed_text, language, meeting_description)
+            summary_text = summarize_conversation_with_gpt(transcribed_text, language, meeting_description)
         else:
-            refined_text = transcribed_text
-            print("Skipping GPT refinement as requested.")
+            summary_text = transcribed_text
+            print("Skipping GPT summarization as requested.")
         
         # Determine output file path
         if output_file_path is None:
@@ -335,8 +335,8 @@ def transcribe_audio(audio_file_path: str, output_file_path: str = None, model_s
             params_str = ", ".join(f"{k}={v}" for k, v in transcribe_params.items() if k != 'verbose')
             f.write(f"Parameters: {params_str}\n")
             
-            # Add GPT refinement information
-            f.write(f"{GPT_MODEL_DISPLAY_NAME} refinement: {'enabled' if use_gpt_refinement else 'disabled'}\n")
+            # Add GPT summarization information
+            f.write(f"{GPT_MODEL_DISPLAY_NAME} summarization: {'enabled' if use_gpt_refinement else 'disabled'}\n")
             
             # Add meeting description if provided
             if meeting_description:
@@ -344,22 +344,25 @@ def transcribe_audio(audio_file_path: str, output_file_path: str = None, model_s
             
             f.write("=" * 50 + "\n\n")
             
-            # Write refined text if GPT was used, otherwise original
+            # Write summary if GPT was used, otherwise original transcription
             if use_gpt_refinement:
-                f.write(f"=== REFINED TRANSCRIPTION ({GPT_MODEL_DISPLAY_NAME}) ===\n\n")
-                f.write(refined_text)
+                f.write(f"=== CONVERSATION SUMMARY ({GPT_MODEL_DISPLAY_NAME}) ===\n\n")
+                f.write(summary_text)
                 f.write("\n\n" + "=" * 50 + "\n")
                 f.write("=== ORIGINAL TRANSCRIPTION (Whisper) ===\n\n")
                 f.write(transcribed_text)
             else:
                 f.write(transcribed_text)
         
-        print(f"Transcription completed!")
+        print(f"Processing completed!")
         print(f"Output saved to: {output_file_path}")
         
-        # Show preview of final result (refined if GPT was used)
-        final_text = refined_text if use_gpt_refinement else transcribed_text
-        print(f"Final transcription preview (first 200 characters):")
+        # Show preview of final result (summary if GPT was used)
+        final_text = summary_text if use_gpt_refinement else transcribed_text
+        if use_gpt_refinement:
+            print(f"Final summary preview (first 200 characters):")
+        else:
+            print(f"Final transcription preview (first 200 characters):")
         print(f"{final_text[:200]}...")
         
         return final_text
@@ -382,11 +385,11 @@ def main():
         print(f"  model_size: Whisper model size (default: {DEFAULT_MODEL_SIZE})")
         print("  --language: Language code (e.g., 'he', 'en', 'fr') to skip auto-detection")
         print("  --max-duration: Maximum duration in minutes to transcribe (e.g., 1, 5, 10.5)")
-        print("  --description: Meeting description for better GPT refinement context")
-        print(f"  --no-gpt: Disable {GPT_MODEL_DISPLAY_NAME} refinement and use only Whisper transcription")
+        print("  --description: Meeting description for better GPT summarization context")
+        print(f"  --no-gpt: Disable {GPT_MODEL_DISPLAY_NAME} summarization and use only Whisper transcription")
         print("  Supported video formats: .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v")
         print("  Requires ffmpeg for video file conversion")
-        print(f"  Requires OPENAI_API_KEY environment variable for {GPT_MODEL_DISPLAY_NAME} refinement")
+        print(f"  Requires OPENAI_API_KEY environment variable for {GPT_MODEL_DISPLAY_NAME} summarization")
         print("\nExamples:")
         print("  python transcribe_audio.py recording.mp4")
         print("  python transcribe_audio.py recording.mp4 large-v3-turbo")
@@ -471,8 +474,8 @@ def main():
         base_name = os.path.splitext(input_file)[0]
         output_file_path = f"{base_name}_transcription.txt"
         
-        print("Starting transcription...")
-        transcribed_text = transcribe_audio(
+        print("Starting transcription and processing...")
+        processed_text = transcribe_audio(
             audio_file, 
             output_file_path=output_file_path, 
             model_size=model_size,
@@ -483,7 +486,10 @@ def main():
             meeting_description=meeting_description
         )
 
-        print(f"\nFull transcription length: {len(transcribed_text)} characters")
+        if use_gpt_refinement:
+            print(f"\nFull summary length: {len(processed_text)} characters")
+        else:
+            print(f"\nFull transcription length: {len(processed_text)} characters")
         
     finally:
         # Clean up temporary audio file if it was created
