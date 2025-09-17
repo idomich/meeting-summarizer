@@ -1,0 +1,39 @@
+# Initial installation Instructions:
+#  pip install pre-commit (install the pre-commit package)
+#  pre-commit install (install the git hook scripts)
+#  pre-commit run --all-files (run the git hook scripts on all files - this will only be necessary if you have already committed files before installing the git hook scripts)
+#
+# Note: this configuration assumes the following files are present in the repository:
+#  - requirements.txt (list of dependencies for the project, needed for the mypy hook)
+#  - mypy.ini (defined as the MyPy configuration file in the mypy hook)
+#  - .flake8 (used by flakes hook by default)
+#  - pyproject.toml (used by black & isort hooks by default)
+#
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+
+  - repo: https://github.com/ambv/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        language_version: python3.11
+
+  - repo: https://github.com/pycqa/flake8
+    rev: '7.1.1'
+    hooks:
+      - id: flake8
+
+  - repo: local
+    hooks:
+      - id: mypy-runner
+        name: mypy
+        entry: sh -c 'pip install -r requirements.txt > /dev/null && /bin/sh mypy_runner.sh'
+        language: system
+        types: [python]
+        pass_filenames: true
+        stages: [pre-commit]

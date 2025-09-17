@@ -1,0 +1,7 @@
+# Auto-activate conda environment for this project
+# Use conda activate through direnv
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate meeting-summarizer
+
+# OpenAI API Key for transcription refinement
+export OPENAI_API_KEY="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"
