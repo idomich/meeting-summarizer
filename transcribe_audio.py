@@ -45,15 +45,58 @@ def format_duration(seconds: float) -> str:
         return f"{minutes}m {remaining_seconds:.1f}s"
 
 
+def format_structured_transcription(result: dict) -> str:
+    """
+    Format Whisper transcription result with timing and confidence information
+
+    Args:
+        result: Whisper transcription result dictionary
+
+    Returns:
+        Formatted string with timing and confidence data
+    """
+    if "segments" not in result:
+        return result.get("text", "")
+
+    formatted_lines = []
+    formatted_lines.append("=== STRUCTURED TRANSCRIPTION WITH TIMING & CONFIDENCE ===\n")
+
+    for segment in result["segments"]:
+        start_time = segment.get("start", 0)
+        end_time = segment.get("end", 0)
+        text = segment.get("text", "").strip()
+        avg_logprob = segment.get("avg_logprob", 0)  # Average log probability (confidence)
+        no_speech_prob = segment.get("no_speech_prob", 0)  # Probability of no speech
+
+        # Convert log probability to a more intuitive confidence score (0-1)
+        confidence = min(max(1 + (avg_logprob / 2), 0), 1)  # Rough conversion
+
+        # Format timestamp
+        def format_timestamp(seconds):
+            minutes = int(seconds // 60)
+            secs = seconds % 60
+            return f"{minutes:02d}:{secs:05.2f}"
+
+        # Only include segments with actual speech content
+        if text and no_speech_prob < 0.5:
+            formatted_lines.append(
+                f"[{format_timestamp(start_time)} --> {format_timestamp(end_time)}] "
+                f"(confidence: {confidence:.2f}) {text}"
+            )
+
+    return "\n".join(formatted_lines)
+
+
 def summarize_conversation_with_gpt(
-    transcription: str, language_detected: str = None, meeting_description: str = None
+    transcription_data, language_detected: str = None, meeting_description: str = None
 ) -> str:
     """
     Summarize the conversation using GPT-5 to create a detailed summary
     preserving the flow of thinking
 
     Args:
-        transcription: The raw transcription text from Whisper
+        transcription_data: Either a structured transcription string with timing/confidence
+                          or the raw Whisper result dictionary
         language_detected: The detected language of the original audio (optional)
         meeting_description: Description of the meeting context (optional)
 
@@ -61,6 +104,16 @@ def summarize_conversation_with_gpt(
         Detailed conversation summary
     """
     client = OpenAI()  # Will use OPENAI_API_KEY environment variable
+
+    # Handle both structured and simple transcription formats
+    if isinstance(transcription_data, dict):
+        # If we get the raw Whisper result, format it with timing/confidence
+        structured_transcription = format_structured_transcription(transcription_data)
+        has_timing_info = True
+    else:
+        # If we get a pre-formatted string, use it directly
+        structured_transcription = str(transcription_data)
+        has_timing_info = "confidence:" in structured_transcription
 
     # Create meeting context section if description provided
     meeting_context = ""
@@ -78,6 +131,18 @@ def summarize_conversation_with_gpt(
             f"\n\nNote: The original audio was in language "
             f"'{language_detected}', so some transcription errors may be "
             "present due to automatic speech recognition."
+        )
+
+    # Timing and confidence context
+    timing_context = ""
+    if has_timing_info:
+        timing_context = (
+            "\n\nNote: The transcription includes timing information [MM:SS.ss --> MM:SS.ss] "
+            "and confidence scores (0.0-1.0) for each segment. Use this information to:\n"
+            "- Understand the natural flow and pacing of the conversation\n"
+            "- Identify segments with lower confidence that may need interpretation\n"
+            "- Recognize natural breaks, pauses, and transitions in the discussion\n"
+            "- Better preserve the chronological structure of the conversation"
         )
 
     # Summarization instructions
@@ -112,10 +177,10 @@ def summarize_conversation_with_gpt(
     # Build the complete prompt
     prompt = f"""{prompt_header}
 
-{task_instruction}{meeting_context}{language_context}
+{task_instruction}{meeting_context}{language_context}{timing_context}
 
 Original transcript:
-{transcription}
+{structured_transcription}
 
 {output_request}"""
 
@@ -152,7 +217,7 @@ Original transcript:
     except Exception as e:
         print(f"Warning: {GPT_MODEL_DISPLAY_NAME} summarization failed: {e}")
         print("Returning original transcription...")
-        return transcription
+        return structured_transcription
 
 
 def convert_video_to_audio(
@@ -177,9 +242,10 @@ def convert_video_to_audio(
     # Get original file size
     original_size = os.path.getsize(video_file_path)
 
-    # Create temporary audio file path
+    # Create temporary audio file path with timestamp to avoid conflicts
     video_path = Path(video_file_path)
-    temp_audio_path = os.path.join(temp_dir, f"{video_path.stem}_temp_audio.mp3")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds precision
+    temp_audio_path = os.path.join(temp_dir, f"{video_path.stem}_temp_audio_{timestamp}.mp3")
 
     print(f"Converting video to audio: {video_file_path}")
     print(f"Original file size: {format_file_size(original_size)}")
@@ -310,10 +376,11 @@ def process_audio_with_duration_limit(
     # Get original file size
     original_size = os.path.getsize(audio_file_path)
 
-    # Create temporary processed audio file path
+    # Create temporary processed audio file path with timestamp to avoid conflicts
     audio_path = Path(audio_file_path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds precision
     temp_processed_path = os.path.join(
-        temp_dir, f"{audio_path.stem}_processed_{max_duration_minutes}min.mp3"
+        temp_dir, f"{audio_path.stem}_processed_{max_duration_minutes}min_{timestamp}.mp3"
     )
 
     print(f"Extracting first {max_duration_minutes} minutes from audio file...")
@@ -385,9 +452,10 @@ def trim_silence_from_audio(audio_file_path: str, temp_dir: str = None) -> str:
     # Get original file size
     original_size = os.path.getsize(audio_file_path)
 
-    # Create temporary trimmed audio file path
+    # Create temporary trimmed audio file path with timestamp to avoid conflicts
     audio_path = Path(audio_file_path)
-    temp_trimmed_path = os.path.join(temp_dir, f"{audio_path.stem}_silencetrimmed.mp3")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds precision
+    temp_trimmed_path = os.path.join(temp_dir, f"{audio_path.stem}_silencetrimmed_{timestamp}.mp3")
 
     print("Removing silence from audio file...")
     print(f"Original audio file size: {format_file_size(original_size)}")
@@ -546,10 +614,11 @@ def transcribe_audio(
         # Summarize conversation with GPT if enabled
         if use_gpt_refinement:
             summary_text = summarize_conversation_with_gpt(
-                transcribed_text, language, meeting_description
+                result, language, meeting_description  # Pass full result with segments
             )
         else:
-            summary_text = transcribed_text
+            # When not using GPT, still provide structured format for consistency
+            summary_text = format_structured_transcription(result)
             print("Skipping GPT summarization as requested.")
 
         total_transcription_time = time.time() - transcription_start_time
@@ -585,6 +654,7 @@ def transcribe_audio(
             )
             f.write(f"Parameters: {params_str}\n")
             f.write("Silence trimming: applied\n")
+            f.write("Enhanced format: timing & confidence data included\n")
 
             # Add GPT summarization information
             gpt_status = "enabled" if use_gpt_refinement else "disabled"
@@ -596,15 +666,15 @@ def transcribe_audio(
 
             f.write("=" * 50 + "\n\n")
 
-            # Write summary if GPT was used, otherwise original transcription
+            # Write summary if GPT was used, otherwise structured transcription
             if use_gpt_refinement:
                 f.write(f"=== CONVERSATION SUMMARY ({GPT_MODEL_DISPLAY_NAME}) ===\n\n")
                 f.write(summary_text)
                 f.write("\n\n" + "=" * 50 + "\n")
-                f.write("=== ORIGINAL TRANSCRIPTION (Whisper) ===\n\n")
-                f.write(transcribed_text)
+                f.write("=== ORIGINAL TRANSCRIPTION WITH TIMING & CONFIDENCE (Whisper) ===\n\n")
+                f.write(format_structured_transcription(result))
             else:
-                f.write(transcribed_text)
+                f.write(summary_text)  # This is already the structured format
 
         print("Processing completed!")
         print(f"Output saved to: {output_file_path}")
@@ -614,11 +684,11 @@ def transcribe_audio(
         print(f"Output file size: {format_file_size(output_file_size)}")
 
         # Show preview of final result (summary if GPT was used)
-        final_text = summary_text if use_gpt_refinement else transcribed_text
+        final_text = summary_text
         if use_gpt_refinement:
             print("Final summary preview (first 200 characters):")
         else:
-            print("Final transcription preview (first 200 characters):")
+            print("Final structured transcription preview (first 200 characters):")
         print(f"{final_text[:200]}...")
 
         return final_text, output_file_path
@@ -793,7 +863,7 @@ def main():
         print("\n=== PERFORMANCE SUMMARY ===")
         print(f"Total processing time: {format_duration(overall_time)}")
         print(f"Original file size: {format_file_size(os.path.getsize(input_file))}")
-        if is_video:
+        if is_video and audio_file and os.path.exists(audio_file):
             print(f"Audio file size: {format_file_size(os.path.getsize(audio_file))}")
         print(f"Output file size: {format_file_size(os.path.getsize(actual_output_path))}")
         print(f"Output file: {os.path.basename(actual_output_path)}")
