@@ -1,3 +1,5 @@
+import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -8,10 +10,11 @@ from pathlib import Path
 
 import whisper
 from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 DEFAULT_MODEL_SIZE = "large-v3-turbo"
-DEFAULT_DETECTOR_SIZE = "base"  # Better accuracy for language detection
-MIN_LANGUAGE_CONFIDENCE = 0.8  # Minimum confidence threshold
+DEFAULT_DETECTOR_SIZE = "base"
+MIN_LANGUAGE_CONFIDENCE = 0.8
 
 # GPT model configuration
 GPT_MODEL_NAME = "gpt-5"
@@ -19,6 +22,13 @@ GPT_MODEL_DISPLAY_NAME = "GPT-5 (high)"
 
 # Video file extensions that require conversion
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -87,6 +97,7 @@ def format_structured_transcription(result: dict) -> str:
     return "\n".join(formatted_lines)
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def summarize_conversation_with_gpt(
     transcription_data, language_detected: str = None, meeting_description: str = None
 ) -> str:
@@ -185,8 +196,8 @@ Original transcript:
 {output_request}"""
 
     start_time = time.time()
-    print(f"Summarizing conversation with {GPT_MODEL_DISPLAY_NAME}...")
-    print("This may take a moment...")
+    logger.info(f"Summarizing conversation with {GPT_MODEL_DISPLAY_NAME}...")
+    logger.info("This may take a moment...")
 
     try:
         response = client.chat.completions.create(
@@ -210,13 +221,13 @@ Original transcript:
         summary_text = response.choices[0].message.content
         summarization_time = time.time() - start_time
 
-        print(f"{GPT_MODEL_DISPLAY_NAME} summarization completed successfully!")
-        print(f"Summarization time: {format_duration(summarization_time)}")
+        logger.info(f"{GPT_MODEL_DISPLAY_NAME} summarization completed successfully!")
+        logger.info(f"Summarization time: {format_duration(summarization_time)}")
         return summary_text
 
     except Exception as e:
-        print(f"Warning: {GPT_MODEL_DISPLAY_NAME} summarization failed: {e}")
-        print("Returning original transcription...")
+        logger.warning(f"{GPT_MODEL_DISPLAY_NAME} summarization failed: {e}")
+        logger.info("Returning original transcription...")
         return structured_transcription
 
 
@@ -247,9 +258,9 @@ def convert_video_to_audio(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds precision
     temp_audio_path = os.path.join(temp_dir, f"{video_path.stem}_temp_audio_{timestamp}.mp3")
 
-    print(f"Converting video to audio: {video_file_path}")
-    print(f"Original file size: {format_file_size(original_size)}")
-    print(f"Temporary audio file: {temp_audio_path}")
+    logger.info(f"Converting video to audio: {video_file_path}")
+    logger.info(f"Original file size: {format_file_size(original_size)}")
+    logger.debug(f"Temporary audio file: {temp_audio_path}")
 
     # Check if ffmpeg is available
     try:
@@ -288,12 +299,14 @@ def convert_video_to_audio(
         converted_size = os.path.getsize(temp_audio_path)
         conversion_time = time.time() - start_time
 
-        print("Video conversion completed successfully!")
-        print(f"Converted file size: {format_file_size(converted_size)}")
+        logger.info("Video conversion completed successfully!")
+        logger.info(f"Converted file size: {format_file_size(converted_size)}")
         size_reduction = original_size - converted_size
         reduction_pct = size_reduction / original_size * 100
-        print(f"Size reduction: {format_file_size(size_reduction)} " f"({reduction_pct:.1f}%)")
-        print(f"Conversion time: {format_duration(conversion_time)}")
+        logger.info(
+            f"Size reduction: {format_file_size(size_reduction)} " f"({reduction_pct:.1f}%)"
+        )
+        logger.info(f"Conversion time: {format_duration(conversion_time)}")
 
         return temp_audio_path
     except subprocess.CalledProcessError as e:
@@ -314,11 +327,11 @@ def detect_audio_language(
         Tuple of (language_code, confidence) e.g., ('he', 0.85)
     """
     start_time = time.time()
-    print(f"Detecting language using {detector_size} model...")
+    logger.info(f"Detecting language using {detector_size} model...")
 
     # Load model for language detection
-    print(f"Loading Whisper {detector_size} model for language detection...")
-    print("(This may download the model if not already cached)")
+    logger.info(f"Loading Whisper {detector_size} model for language detection...")
+    logger.info("(This may download the model if not already cached)")
     detector = whisper.load_model(detector_size)
 
     # Load and process audio (uses standard 30-second segment)
@@ -334,22 +347,22 @@ def detect_audio_language(
 
     detection_time = time.time() - start_time
 
-    print(f"Detected language: {detected_language} (confidence: {confidence:.2f})")
-    print(f"Language detection time: {format_duration(detection_time)}")
+    logger.info(f"Detected language: {detected_language} (confidence: {confidence:.2f})")
+    logger.info(f"Language detection time: {format_duration(detection_time)}")
 
     # Show top 3 language predictions
     sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)[:3]
-    print("Top language predictions:")
+    logger.info("Top language predictions:")
     for lang, prob in sorted_probs:
-        print(f"  {lang}: {prob:.3f}")
+        logger.info(f"  {lang}: {prob:.3f}")
 
     # Check confidence threshold
     if confidence < MIN_LANGUAGE_CONFIDENCE:
-        print(
-            f"Warning: Language detection confidence ({confidence:.2f}) is "
+        logger.warning(
+            f"Language detection confidence ({confidence:.2f}) is "
             f"below threshold ({MIN_LANGUAGE_CONFIDENCE:.2f})"
         )
-        print("Consider manually specifying the language using the " "--language parameter")
+        logger.info("Consider manually specifying the language using the --language parameter")
 
     return detected_language, confidence
 
@@ -383,8 +396,8 @@ def process_audio_with_duration_limit(
         temp_dir, f"{audio_path.stem}_processed_{max_duration_minutes}min_{timestamp}.mp3"
     )
 
-    print(f"Extracting first {max_duration_minutes} minutes from audio file...")
-    print(f"Original audio file size: {format_file_size(original_size)}")
+    logger.info(f"Extracting first {max_duration_minutes} minutes from audio file...")
+    logger.info(f"Original audio file size: {format_file_size(original_size)}")
 
     # Check if ffmpeg is available
     try:
@@ -419,14 +432,14 @@ def process_audio_with_duration_limit(
         processed_size = os.path.getsize(temp_processed_path)
         processing_time = time.time() - start_time
 
-        print(
+        logger.info(
             f"Audio processing completed successfully! Limited to {max_duration_minutes} minutes."
         )
-        print(f"Processed file size: {format_file_size(processed_size)}")
+        logger.info(f"Processed file size: {format_file_size(processed_size)}")
         size_reduction = original_size - processed_size
         reduction_pct = size_reduction / original_size * 100
-        print(f"Size reduction: {format_file_size(size_reduction)} " f"({reduction_pct:.1f}%)")
-        print(f"Processing time: {format_duration(processing_time)}")
+        logger.info(f"Size reduction: {format_file_size(size_reduction)} ({reduction_pct:.1f}%)")
+        logger.info(f"Processing time: {format_duration(processing_time)}")
 
         return temp_processed_path
     except subprocess.CalledProcessError as e:
@@ -457,14 +470,14 @@ def trim_silence_from_audio(audio_file_path: str, temp_dir: str = None) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds precision
     temp_trimmed_path = os.path.join(temp_dir, f"{audio_path.stem}_silencetrimmed_{timestamp}.mp3")
 
-    print("Removing silence from audio file...")
-    print(f"Original audio file size: {format_file_size(original_size)}")
+    logger.info("Removing silence from audio file...")
+    logger.info(f"Original audio file size: {format_file_size(original_size)}")
 
     # Check if ffmpeg is available
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Warning: ffmpeg not available, skipping silence removal")
+        logger.warning("ffmpeg not available, skipping silence removal")
         return audio_file_path
 
     # Remove silence using ffmpeg with conservative settings
@@ -495,17 +508,19 @@ def trim_silence_from_audio(audio_file_path: str, temp_dir: str = None) -> str:
         trimmed_size = os.path.getsize(temp_trimmed_path)
         trimming_time = time.time() - start_time
 
-        print("Silence removal completed successfully!")
-        print(f"Trimmed file size: {format_file_size(trimmed_size)}")
+        logger.info("Silence removal completed successfully!")
+        logger.info(f"Trimmed file size: {format_file_size(trimmed_size)}")
         if trimmed_size < original_size:
             size_reduction = original_size - trimmed_size
             reduction_pct = size_reduction / original_size * 100
-            print(f"Size reduction: {format_file_size(size_reduction)} " f"({reduction_pct:.1f}%)")
-        print(f"Silence removal time: {format_duration(trimming_time)}")
+            logger.info(
+                f"Size reduction: {format_file_size(size_reduction)} ({reduction_pct:.1f}%)"
+            )
+        logger.info(f"Silence removal time: {format_duration(trimming_time)}")
 
         return temp_trimmed_path
     except subprocess.CalledProcessError as e:
-        print(f"Warning: Failed to trim silence ({e.stderr}), using original audio")
+        logger.warning(f"Failed to trim silence ({e.stderr}), using original audio")
         return audio_file_path
 
 
@@ -554,7 +569,7 @@ def transcribe_audio(
     actual_audio_file = audio_file_path
 
     if max_duration_minutes is not None:
-        print(f"Limiting transcription to first {max_duration_minutes} minutes...")
+        logger.info(f"Limiting transcription to first {max_duration_minutes} minutes...")
         actual_audio_file = process_audio_with_duration_limit(
             audio_file_path, max_duration_minutes
         )
@@ -567,25 +582,25 @@ def transcribe_audio(
         if language is None:
             language, confidence = detect_audio_language(actual_audio_file)
         else:
-            print(f"Using specified language: {language}")
+            logger.info(f"Using specified language: {language}")
             confidence = None
 
         # Apply silence trimming for better accuracy
-        print("\nApplying audio preprocessing...")
+        logger.info("Applying audio preprocessing...")
         trimmed_audio_file = trim_silence_from_audio(actual_audio_file)
 
         model_load_start = time.time()
-        print(f"Loading Whisper model ({model_size})...")
-        print("(This may download the model if not already cached)")
+        logger.info(f"Loading Whisper model ({model_size})...")
+        logger.info("(This may download the model if not already cached)")
         model = whisper.load_model(model_size)
         model_load_time = time.time() - model_load_start
-        print(f"Model loading time: {format_duration(model_load_time)}")
+        logger.info(f"Model loading time: {format_duration(model_load_time)}")
 
         duration_info = (
             f" (first {max_duration_minutes} minutes only)" if max_duration_minutes else ""
         )
-        print(f"Transcribing audio file: {audio_file_path}{duration_info}")
-        print("This may take a few minutes depending on the file size...")
+        logger.info(f"Transcribing audio file: {audio_file_path}{duration_info}")
+        logger.info("This may take a few minutes depending on the file size...")
 
         # Define transcription parameters (only non-defaults)
         transcribe_params = {
@@ -596,11 +611,11 @@ def transcribe_audio(
             "verbose": True,  # Show progress (default: False)
         }
 
-        # Print parameters being used
+        # Log parameters being used
         param_summary = ", ".join(
             f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
         )
-        print(f"Using parameters: {param_summary}")
+        logger.info(f"Using parameters: {param_summary}")
 
         # Transcribe using the silence-trimmed audio file
         transcription_process_start = time.time()
@@ -609,7 +624,7 @@ def transcribe_audio(
 
         # Extract the transcribed text
         transcribed_text = result["text"]
-        print(f"\nWhisper transcription time: {format_duration(transcription_process_time)}")
+        logger.info(f"Whisper transcription time: {format_duration(transcription_process_time)}")
 
         # Summarize conversation with GPT if enabled
         if use_gpt_refinement:
@@ -619,11 +634,11 @@ def transcribe_audio(
         else:
             # When not using GPT, still provide structured format for consistency
             summary_text = format_structured_transcription(result)
-            print("Skipping GPT summarization as requested.")
+            logger.info("Skipping GPT summarization as requested.")
 
         total_transcription_time = time.time() - transcription_start_time
-        print(
-            f"\nTotal transcription processing time: {format_duration(total_transcription_time)}"
+        logger.info(
+            f"Total transcription processing time: {format_duration(total_transcription_time)}"
         )
 
         # Determine output file path with timestamp to avoid overwriting
@@ -676,20 +691,20 @@ def transcribe_audio(
             else:
                 f.write(summary_text)  # This is already the structured format
 
-        print("Processing completed!")
-        print(f"Output saved to: {output_file_path}")
+        logger.info("Processing completed!")
+        logger.info(f"Output saved to: {output_file_path}")
 
         # Show file information
         output_file_size = os.path.getsize(output_file_path)
-        print(f"Output file size: {format_file_size(output_file_size)}")
+        logger.info(f"Output file size: {format_file_size(output_file_size)}")
 
         # Show preview of final result (summary if GPT was used)
         final_text = summary_text
         if use_gpt_refinement:
-            print("Final summary preview (first 200 characters):")
+            logger.info("Final summary preview (first 200 characters):")
         else:
-            print("Final structured transcription preview (first 200 characters):")
-        print(f"{final_text[:200]}...")
+            logger.info("Final structured transcription preview (first 200 characters):")
+        logger.info(f"{final_text[:200]}...")
 
         return final_text, output_file_path
 
@@ -698,9 +713,9 @@ def transcribe_audio(
         if temp_processed_file and os.path.exists(temp_processed_file):
             try:
                 os.remove(temp_processed_file)
-                print(f"Cleaned up temporary processed file: {temp_processed_file}")
+                logger.debug(f"Cleaned up temporary processed file: {temp_processed_file}")
             except OSError as e:
-                print(f"Warning: Could not remove temporary file {temp_processed_file}: {e}")
+                logger.warning(f"Could not remove temporary file {temp_processed_file}: {e}")
 
         # Clean up trimmed audio file if it was created and is different from original
         try:
@@ -710,113 +725,115 @@ def transcribe_audio(
                 and os.path.exists(trimmed_audio_file)
             ):
                 os.remove(trimmed_audio_file)
-                print(f"Cleaned up temporary trimmed audio file: {trimmed_audio_file}")
+                logger.debug(f"Cleaned up temporary trimmed audio file: {trimmed_audio_file}")
         except (OSError, NameError) as e:
             if "trimmed_audio_file" in locals():
-                print(
-                    f"Warning: Could not remove temporary trimmed file {trimmed_audio_file}: {e}"
+                logger.warning(
+                    f"Could not remove temporary trimmed file {trimmed_audio_file}: {e}"
                 )
 
 
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments using argparse"""
+    parser = argparse.ArgumentParser(
+        description="Transcribe audio/video files using Whisper and summarize with GPT",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  %(prog)s recording.mp4
+  %(prog)s recording.mp4 --model large-v3-turbo
+  %(prog)s recording.mp4 --description 'Weekly team standup discussing project progress'
+  %(prog)s recording.mp4 --language he --description 'Technical discussion about ML models'
+  %(prog)s recording.mp4 --max-duration 1 --description 'Quick client call about requirements'
+  %(prog)s recording.mp4 --no-gpt
+
+Supported formats:
+  Audio: .mp3, .wav, .flac, .m4a, .aac, .ogg
+  Video: .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v (requires ffmpeg)
+
+Requirements:
+  - ffmpeg for video file conversion
+  - OPENAI_API_KEY environment variable for {GPT_MODEL_DISPLAY_NAME} summarization
+        """,
+    )
+
+    parser.add_argument(
+        "input_file", help="Path to audio (.mp3, .wav, etc.) or video (.mp4, .avi, etc.) file"
+    )
+
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_SIZE,
+        help=f"Whisper model size (default: {DEFAULT_MODEL_SIZE})",
+    )
+
+    parser.add_argument(
+        "--language", help="Language code (e.g., 'he', 'en', 'fr') to skip auto-detection"
+    )
+
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        metavar="MINUTES",
+        help="Maximum duration in minutes to transcribe (e.g., 1, 5, 10.5)",
+    )
+
+    parser.add_argument(
+        "--description", help="Meeting description for better GPT summarization context"
+    )
+
+    parser.add_argument(
+        "--no-gpt",
+        action="store_true",
+        help=f"Disable {GPT_MODEL_DISPLAY_NAME} summarization and use only Whisper transcription",
+    )
+
+    parser.add_argument(
+        "--output", help="Output file path (default: auto-generated with timestamp)"
+    )
+
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Set logging level (default: INFO)",
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if not os.path.exists(args.input_file):
+        parser.error(f"Input file not found: {args.input_file}")
+
+    if args.max_duration is not None and args.max_duration <= 0:
+        parser.error("--max-duration must be a positive number")
+
+    return args
+
+
 def main():
-    # Show usage if requested
-    if len(sys.argv) > 1 and sys.argv[1] in ["-h", "--help"]:
-        print(
-            "Usage: python transcribe_audio.py [input_file] [model_size] "
-            "[--language LANG] [--max-duration MINUTES] [--description DESC] "
-            "[--no-gpt]"
-        )
-        print("  input_file: Path to audio (.mp3, .wav, etc.) or video " "(.mp4, .avi, etc.) file")
-        print(f"  model_size: Whisper model size (default: {DEFAULT_MODEL_SIZE})")
-        print("  --language: Language code (e.g., 'he', 'en', 'fr') to skip " "auto-detection")
-        print("  --max-duration: Maximum duration in minutes to transcribe " "(e.g., 1, 5, 10.5)")
-        print("  --description: Meeting description for better GPT " "summarization context")
-        print(
-            f"  --no-gpt: Disable {GPT_MODEL_DISPLAY_NAME} summarization and "
-            "use only Whisper transcription"
-        )
-        print("  Supported video formats: .mp4, .avi, .mov, .mkv, .wmv, " ".flv, .webm, .m4v")
-        print("  Requires ffmpeg for video file conversion")
-        print(
-            f"  Requires OPENAI_API_KEY environment variable for "
-            f"{GPT_MODEL_DISPLAY_NAME} summarization"
-        )
-        print("\nExamples:")
-        print("  python transcribe_audio.py recording.mp4")
-        print("  python transcribe_audio.py recording.mp4 large-v3-turbo")
-        print(
-            "  python transcribe_audio.py recording.mp4 --description "
-            "'Weekly team standup discussing project progress'"
-        )
-        print(
-            "  python transcribe_audio.py recording.mp4 --language he "
-            "--description 'Technical discussion about machine learning models'"
-        )
-        print(
-            "  python transcribe_audio.py recording.mp4 --max-duration 1 "
-            "--description 'Quick client call about requirements'"
-        )
-        print("  python transcribe_audio.py recording.mp4 --no-gpt")
-        sys.exit(0)
+    """Main entry point with improved error handling and logging"""
+    try:
+        args = parse_arguments()
 
-    # Check if input file provided
-    if len(sys.argv) < 2:
-        print("Error: Please provide an input file")
-        print(
-            "Usage: python transcribe_audio.py [input_file] [model_size] "
-            "[--language LANG] [--max-duration MINUTES] [--description DESC] "
-            "[--no-gpt]"
-        )
-        print("Use --help for more information")
-        sys.exit(1)
+        # Set up logging level
+        logger.setLevel(getattr(logging, args.log_level))
+        for handler in logger.handlers:
+            handler.setLevel(getattr(logging, args.log_level))
 
-    input_file = sys.argv[1]
-    model_size = DEFAULT_MODEL_SIZE
-    language = None
-    max_duration_minutes = None
-    use_gpt_refinement = True
-    meeting_description = None
+        input_file = args.input_file
+        model_size = args.model
+        language = args.language
+        max_duration_minutes = args.max_duration
+        use_gpt_refinement = not args.no_gpt
+        meeting_description = args.description
+        output_file_path = args.output
 
-    # Parse remaining arguments
-    i = 2
-    while i < len(sys.argv):
-        arg = sys.argv[i]
-        if arg == "--language":
-            if i + 1 >= len(sys.argv):
-                print("Error: --language requires a language code")
-                sys.exit(1)
-            language = sys.argv[i + 1]
-            i += 2
-        elif arg == "--max-duration":
-            if i + 1 >= len(sys.argv):
-                print("Error: --max-duration requires a duration in minutes")
-                sys.exit(1)
-            try:
-                max_duration_minutes = float(sys.argv[i + 1])
-                if max_duration_minutes <= 0:
-                    print("Error: --max-duration must be a positive number")
-                    sys.exit(1)
-            except ValueError:
-                print("Error: --max-duration must be a valid number")
-                sys.exit(1)
-            i += 2
-        elif arg == "--description":
-            if i + 1 >= len(sys.argv):
-                print("Error: --description requires a meeting description")
-                sys.exit(1)
-            meeting_description = sys.argv[i + 1]
-            i += 2
-        elif arg == "--no-gpt":
-            use_gpt_refinement = False
-            i += 1
-        else:
-            # Assume it's model size if not a flag
-            model_size = arg
-            i += 1
-
-    # Check if input file exists
-    if not os.path.exists(input_file):
-        print(f"Error: Input file not found: {input_file}")
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Error parsing arguments: {e}")
         sys.exit(1)
 
     # Determine if input is video or audio
@@ -828,20 +845,17 @@ def main():
         overall_start_time = time.time()
 
         if is_video:
-            print(f"Detected video file: {input_file}")
+            logger.info(f"Detected video file: {input_file}")
             # Convert video to audio (with optional duration limit)
             audio_file = convert_video_to_audio(
                 input_file, max_duration_minutes=max_duration_minutes
             )
             temp_audio_file = audio_file  # Keep track for cleanup
         else:
-            print(f"Detected audio file: {input_file}")
+            logger.info(f"Detected audio file: {input_file}")
             audio_file = input_file
 
-        # Let transcribe_audio function handle the timestamped naming
-        output_file_path = None
-
-        print("Starting transcription and processing...")
+        logger.info("Starting transcription and processing...")
         processed_text, actual_output_path = transcribe_audio(
             audio_file,
             output_file_path=output_file_path,
@@ -856,27 +870,33 @@ def main():
         overall_time = time.time() - overall_start_time
 
         if use_gpt_refinement:
-            print(f"\nFull summary length: {len(processed_text)} characters")
+            logger.info(f"Full summary length: {len(processed_text)} characters")
         else:
-            print(f"\nFull transcription length: {len(processed_text)} characters")
+            logger.info(f"Full transcription length: {len(processed_text)} characters")
 
-        print("\n=== PERFORMANCE SUMMARY ===")
-        print(f"Total processing time: {format_duration(overall_time)}")
-        print(f"Original file size: {format_file_size(os.path.getsize(input_file))}")
+        logger.info("=== PERFORMANCE SUMMARY ===")
+        logger.info(f"Total processing time: {format_duration(overall_time)}")
+        logger.info(f"Original file size: {format_file_size(os.path.getsize(input_file))}")
         if is_video and audio_file and os.path.exists(audio_file):
-            print(f"Audio file size: {format_file_size(os.path.getsize(audio_file))}")
-        print(f"Output file size: {format_file_size(os.path.getsize(actual_output_path))}")
-        print(f"Output file: {os.path.basename(actual_output_path)}")
-        print("=============================")
+            logger.info(f"Audio file size: {format_file_size(os.path.getsize(audio_file))}")
+        logger.info(f"Output file size: {format_file_size(os.path.getsize(actual_output_path))}")
+        logger.info(f"Output file: {os.path.basename(actual_output_path)}")
+        logger.info("=============================")
 
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        sys.exit(1)
     finally:
         # Clean up temporary audio file if it was created
         if temp_audio_file and os.path.exists(temp_audio_file):
             try:
                 os.remove(temp_audio_file)
-                print(f"Cleaned up temporary audio file: {temp_audio_file}")
+                logger.debug(f"Cleaned up temporary audio file: {temp_audio_file}")
             except OSError as e:
-                print(f"Warning: Could not remove temporary file {temp_audio_file}: {e}")
+                logger.warning(f"Could not remove temporary file {temp_audio_file}: {e}")
 
 
 if __name__ == "__main__":
