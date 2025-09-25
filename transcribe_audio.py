@@ -1,13 +1,17 @@
 import argparse
 import logging
+import math
+import multiprocessing
 import os
 import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import psutil
 import whisper
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -23,12 +27,114 @@ GPT_MODEL_DISPLAY_NAME = "GPT-5 (high)"
 # Video file extensions that require conversion
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
 
-# Setup logging
+# Chunking configuration for streaming transcription
+MIN_FILE_SIZE_FOR_CHUNKING_MB = 10  # Minimum file size to trigger chunking (MB)
+CHUNK_OVERLAP_SECONDS = 2  # Overlap between chunks to avoid missing words
+
+# Determine optimal number of parallel processes based on CPU cores
+# Cap at 8 to avoid excessive memory usage (each process loads a ~3-5GB Whisper model)
+_CPU_CORES = multiprocessing.cpu_count()
+MAX_PARALLEL_CHUNKS = min(_CPU_CORES, 8) if _CPU_CORES > 1 else 1
+
+# Setup logging with multiprocessing support
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    force=True,  # Force reconfigure for multiprocessing
 )
 logger = logging.getLogger(__name__)
+
+
+def get_available_memory_gb() -> float:
+    """Get available system memory in GB"""
+    return psutil.virtual_memory().available / (1024**3)
+
+
+def estimate_model_memory_usage(model_size: str) -> float:
+    """
+    Estimate memory usage of a Whisper model without loading it
+
+    Args:
+        model_size: Whisper model size name
+
+    Returns:
+        Estimated memory usage in GB
+    """
+    # Known model specifications based on actual file sizes (MB)
+    # Memory usage is approximately 1.3x the model file size (model weights + computation overhead)
+    model_specs = {
+        "tiny": 72.1,
+        "tiny.en": 72.1,
+        "base": 138.5,
+        "base.en": 138.5,
+        "small": 461.2,
+        "small.en": 461.2,
+        "medium": 1457.2,
+        "medium.en": 1457.2,
+        "large": 2944.3,  # Default to large-v3
+        "large-v1": 2944.3,
+        "large-v2": 160.3,  # Compressed version
+        "large-v3": 2944.3,
+        "large-v3-turbo": 1543.0,
+        "turbo": 1543.0,  # Alias for large-v3-turbo
+    }
+
+    file_size_mb = model_specs.get(model_size, 2944.3)  # Default to large-v3 for unknown models
+    # Memory usage is approximately 1.3x the model file size (model weights + computation overhead)
+    estimated_memory_gb = (file_size_mb * 1.3) / 1024
+
+    logger.info(
+        f"Model {model_size}: {file_size_mb:.1f}MB file → "
+        f"{estimated_memory_gb:.2f}GB estimated memory"
+    )
+    return estimated_memory_gb
+
+
+def calculate_safe_process_count(max_requested: int, model_size: str) -> int:
+    """
+    Calculate a safe number of processes based on available memory and estimated model usage
+
+    Args:
+        max_requested: Maximum number of processes requested
+        model_size: Whisper model size to estimate memory for
+
+    Returns:
+        Safe number of processes that won't exceed available memory
+    """
+    available_memory_gb = get_available_memory_gb()
+
+    # Estimate memory usage without loading the model
+    estimated_memory_gb = estimate_model_memory_usage(model_size)
+
+    # Add safety margin of 0.5GB per process for processing overhead
+    memory_per_process_gb = estimated_memory_gb + 0.5
+
+    # Reserve 2GB for the system and main process
+    usable_memory_gb = max(0, available_memory_gb - 2.0)
+
+    # Calculate how many processes we can safely run
+    safe_processes = max(1, int(usable_memory_gb / memory_per_process_gb))
+
+    # Don't exceed the requested maximum
+    final_processes = min(safe_processes, max_requested)
+
+    logger.info(
+        f"Memory check: {available_memory_gb:.1f}GB available, "
+        f"{memory_per_process_gb:.1f}GB per {model_size} model process "
+        f"(estimated: {estimated_memory_gb:.2f}GB + 0.5GB safety margin)"
+    )
+    logger.info(
+        f"Safe process limit: {safe_processes}, requested: {max_requested}, "
+        f"using: {final_processes}"
+    )
+
+    if final_processes < max_requested:
+        logger.warning(
+            f"Limiting processes from {max_requested} to {final_processes} "
+            f"due to memory constraints"
+        )
+
+    return final_processes
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -53,6 +159,302 @@ def format_duration(seconds: float) -> str:
         minutes = int(seconds // 60)
         remaining_seconds = seconds % 60
         return f"{minutes}m {remaining_seconds:.1f}s"
+
+
+def get_audio_duration(audio_file_path: str) -> float:
+    """
+    Get the duration of an audio file in seconds using ffprobe
+
+    Args:
+        audio_file_path: Path to the audio file
+
+    Returns:
+        Duration in seconds
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            audio_file_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError) as e:
+        logger.warning(f"Could not determine audio duration: {e}")
+        return 0.0
+
+
+def create_audio_chunks(
+    audio_file_path: str,
+    chunk_duration_minutes: float,
+    overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
+    temp_dir: str = None,
+) -> list[str]:
+    """
+    Split audio file into chunks for streaming transcription
+
+    Args:
+        audio_file_path: Path to the audio file
+        chunk_duration_minutes: Duration of each chunk in minutes
+        overlap_seconds: Overlap between chunks in seconds
+        temp_dir: Optional temporary directory for chunk files
+
+    Returns:
+        List of paths to chunk files
+    """
+    if temp_dir is None:
+        temp_dir = tempfile.gettempdir()
+
+    # Get audio duration
+    total_duration = get_audio_duration(audio_file_path)
+    if total_duration <= 0:
+        logger.warning("Could not determine audio duration, falling back to single file")
+        return [audio_file_path]
+
+    chunk_duration_seconds = chunk_duration_minutes * 60
+    logger.info(
+        f"Splitting audio into {chunk_duration_minutes}-minute chunks with "
+        f"{overlap_seconds}s overlap"
+    )
+    logger.info(f"Total duration: {format_duration(total_duration)}")
+
+    # Calculate number of chunks needed
+    effective_chunk_duration = chunk_duration_seconds - overlap_seconds
+    num_chunks = max(
+        1, int((total_duration + effective_chunk_duration - 1) // effective_chunk_duration)
+    )
+    logger.info(f"Creating {num_chunks} chunks")
+
+    # Create chunks
+    chunk_files = []
+    audio_path = Path(audio_file_path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+    for i in range(num_chunks):
+        start_time = i * effective_chunk_duration
+        # Add overlap to all chunks except the first one
+        if i > 0:
+            start_time -= overlap_seconds
+
+        # Calculate end time, ensuring we don't exceed total duration
+        end_time = min(start_time + chunk_duration_seconds, total_duration)
+
+        # Skip if this chunk would be too short
+        if end_time - start_time < 10:  # Skip chunks shorter than 10 seconds
+            continue
+
+        chunk_filename = f"{audio_path.stem}_chunk_{i+1:02d}_{timestamp}.mp3"
+        chunk_path = os.path.join(temp_dir, chunk_filename)
+
+        # Create chunk using ffmpeg
+        cmd = [
+            "ffmpeg",
+            "-i",
+            audio_file_path,
+            "-ss",
+            str(start_time),
+            "-t",
+            str(end_time - start_time),
+            "-acodec",
+            "mp3",
+            "-ab",
+            "192k",
+            "-ar",
+            "44100",
+            "-y",  # Overwrite output file
+            chunk_path,
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, text=True)
+            chunk_files.append(chunk_path)
+            chunk_size = os.path.getsize(chunk_path)
+            logger.info(
+                f"Created chunk {i+1}/{num_chunks}: {format_duration(end_time - start_time)} "
+                f"({format_file_size(chunk_size)})"
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to create chunk {i+1}: {e.stderr}")
+            continue
+
+    if not chunk_files:
+        logger.warning("No chunks created, falling back to original file")
+        return [audio_file_path]
+
+    return chunk_files
+
+
+def transcribe_single_chunk(chunk_info: tuple) -> tuple[int, dict, float]:
+    """
+    Transcribe a single audio chunk - designed to be called in parallel
+
+    Args:
+        chunk_info: Tuple of (chunk_index, chunk_file_path, chunk_start_time, model_size,
+                              transcribe_params)
+
+    Returns:
+        Tuple of (chunk_index, transcription_result, chunk_start_time)
+    """
+    chunk_index, chunk_file, chunk_start_time, model_size, transcribe_params = chunk_info
+
+    # Setup logging for this process (important for multiprocessing)
+    import logging
+
+    # Configure logging for child process
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
+    )
+
+    logger = logging.getLogger(f"chunk_{chunk_index + 1}")
+
+    try:
+        # Load model for this chunk (each process needs its own model instance)
+        logger.info(f"Loading Whisper model ({model_size}) for chunk {chunk_index + 1}...")
+        model = whisper.load_model(model_size)
+
+        logger.info(f"Starting transcription of chunk {chunk_index + 1}...")
+        start_time = time.time()
+
+        # Disable verbose in multiprocessing to avoid stdout conflicts
+        chunk_transcribe_params = transcribe_params.copy()
+        chunk_transcribe_params["verbose"] = False
+
+        # Create a progress callback for better feedback
+        def progress_callback():
+            elapsed = time.time() - start_time
+            logger.info(
+                f"Chunk {chunk_index + 1} transcribing... ({format_duration(elapsed)} elapsed)"
+            )
+
+        # Transcribe the chunk
+        result = model.transcribe(chunk_file, **chunk_transcribe_params)
+
+        transcription_time = time.time() - start_time
+
+        # Show some preview of what was transcribed
+        text_preview = (
+            result.get("text", "")[:100] + "..."
+            if len(result.get("text", "")) > 100
+            else result.get("text", "")
+        )
+        segments_count = len(result.get("segments", []))
+
+        logger.info(
+            f"✅ Completed chunk {chunk_index + 1} in {format_duration(transcription_time)}"
+        )
+        logger.info(f"   📝 {segments_count} segments, preview: '{text_preview}'")
+
+        return chunk_index, result, chunk_start_time
+
+    except Exception as e:
+        logger.error(f"❌ Failed to transcribe chunk {chunk_index + 1}: {e}")
+        # Return empty result for failed chunks
+        return chunk_index, {"text": "", "segments": []}, chunk_start_time
+
+
+def combine_transcription_segments(chunk_results: list[tuple[int, dict, float]]) -> dict:
+    """
+    Combine transcription results from multiple chunks into a single result
+
+    Args:
+        chunk_results: List of tuples containing (chunk_index, transcription_result,
+                                                    chunk_start_time)
+
+    Returns:
+        Combined transcription result with adjusted timing
+    """
+    if not chunk_results:
+        return {"text": "", "segments": []}
+
+    if len(chunk_results) == 1:
+        _, result, _ = chunk_results[0]
+        return result
+
+    # Sort results by chunk index to ensure proper order
+    sorted_results = sorted(chunk_results, key=lambda x: x[0])
+
+    # Combine text from all chunks
+    combined_text = ""
+    combined_segments = []
+    combined_language = None
+
+    for chunk_index, result, chunk_start_time in sorted_results:
+        chunk_text = result.get("text", "")
+        if chunk_text.strip():
+            if combined_text and not combined_text.endswith(" "):
+                combined_text += " "
+            combined_text += chunk_text.strip()
+
+        # Store language from first successful chunk
+        if combined_language is None and result.get("language"):
+            combined_language = result.get("language")
+
+        # Adjust segment timings and combine
+        segments = result.get("segments", [])
+        for segment in segments:
+            adjusted_segment = segment.copy()
+            # Adjust timing to account for chunk start time
+            adjusted_segment["start"] = segment.get("start", 0) + chunk_start_time
+            adjusted_segment["end"] = segment.get("end", 0) + chunk_start_time
+            combined_segments.append(adjusted_segment)
+
+    logger.info(f"Combined {len(chunk_results)} chunks into single transcription")
+    logger.info(f"Total segments: {len(combined_segments)}")
+
+    return {
+        "text": combined_text,
+        "segments": combined_segments,
+        "language": combined_language or "unknown",
+    }
+
+
+def should_use_chunking(audio_file_path: str, max_duration_minutes: float = None) -> bool:
+    """
+    Determine if audio file should be processed in chunks
+
+    Args:
+        audio_file_path: Path to the audio file
+        max_duration_minutes: Optional duration limit (doesn't affect chunking decision)
+
+    Returns:
+        True if chunking should be used
+    """
+    # Check file size
+    try:
+        file_size_mb = os.path.getsize(audio_file_path) / (1024 * 1024)
+        if file_size_mb >= MIN_FILE_SIZE_FOR_CHUNKING_MB:
+            logger.info(
+                f"Large file detected ({format_file_size(os.path.getsize(audio_file_path))}), "
+                "will use chunked transcription"
+            )
+            return True
+    except OSError:
+        pass
+
+    # Check duration (use actual file duration, not the limit)
+    duration_seconds = get_audio_duration(audio_file_path)
+    duration_minutes = duration_seconds / 60
+
+    # If max_duration is specified and is smaller than file duration, use that for decision
+    effective_duration_minutes = duration_minutes
+    if max_duration_minutes is not None and max_duration_minutes < duration_minutes:
+        effective_duration_minutes = max_duration_minutes
+
+    if effective_duration_minutes > 4:  # Use chunking for files >4 min to allow 2-minute chunks
+        logger.info(
+            f"Audio detected ({format_duration(effective_duration_minutes * 60)}), "
+            "will use chunked transcription"
+        )
+        return True
+
+    return False
 
 
 def format_structured_transcription(result: dict) -> str:
@@ -533,6 +935,8 @@ def transcribe_audio(
     max_duration_minutes: float = None,
     use_gpt_refinement: bool = True,
     meeting_description: str = None,
+    use_multiprocessing: bool = False,
+    max_workers: int = MAX_PARALLEL_CHUNKS,
 ) -> tuple[str, str]:
     """
     Transcribe audio file to text using Whisper and optionally create a
@@ -554,6 +958,11 @@ def transcribe_audio(
             using GPT (default: True)
         meeting_description: Optional description of the meeting context
             for better GPT summarization
+        use_multiprocessing: Whether to enable multiprocessing for large files
+            (default: False)
+        max_workers: Maximum number of parallel processes for chunked transcription
+            when multiprocessing is enabled (default: auto-detected from CPU cores, max 8).
+            Actual count may be limited by available memory.
 
     Returns:
         Tuple of (transcribed_text, output_file_path) where transcribed_text
@@ -589,38 +998,202 @@ def transcribe_audio(
         logger.info("Applying audio preprocessing...")
         trimmed_audio_file = trim_silence_from_audio(actual_audio_file)
 
-        model_load_start = time.time()
-        logger.info(f"Loading Whisper model ({model_size})...")
-        logger.info("(This may download the model if not already cached)")
-        model = whisper.load_model(model_size)
-        model_load_time = time.time() - model_load_start
-        logger.info(f"Model loading time: {format_duration(model_load_time)}")
-
-        duration_info = (
-            f" (first {max_duration_minutes} minutes only)" if max_duration_minutes else ""
+        # Check if we should use chunking for large files (only when multiprocessing is enabled)
+        use_chunking = use_multiprocessing and should_use_chunking(
+            trimmed_audio_file, max_duration_minutes
         )
-        logger.info(f"Transcribing audio file: {audio_file_path}{duration_info}")
-        logger.info("This may take a few minutes depending on the file size...")
 
-        # Define transcription parameters (only non-defaults)
-        transcribe_params = {
-            "language": language,  # Use detected or specified language
-            "best_of": 2,  # Try multiple attempts and pick best (default: 5)
-            "beam_size": 3,  # Use beam search for better accuracy (default: 5)
-            "patience": 1.0,  # Wait longer for better results (default: None)
-            "verbose": True,  # Show progress (default: False)
-        }
+        if not use_multiprocessing and should_use_chunking(
+            trimmed_audio_file, max_duration_minutes
+        ):
+            logger.info(
+                "Large file detected but multiprocessing is disabled - "
+                "using single-process transcription"
+            )
+            logger.info(
+                "Consider using --multiprocessing flag for faster processing of large files"
+            )
 
-        # Log parameters being used
-        param_summary = ", ".join(
-            f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
-        )
-        logger.info(f"Using parameters: {param_summary}")
+        if use_chunking:
+            logger.info("Using streaming/chunked transcription for large audio file")
 
-        # Transcribe using the silence-trimmed audio file
-        transcription_process_start = time.time()
-        result = model.transcribe(trimmed_audio_file, **transcribe_params)
-        transcription_process_time = time.time() - transcription_process_start
+            # First, determine memory-safe worker count
+            memory_safe_workers = calculate_safe_process_count(max_workers, model_size)
+
+            # Now optimize chunk size to match the ACTUAL number of workers we can use
+            audio_duration_seconds = get_audio_duration(trimmed_audio_file)
+            audio_duration_minutes = audio_duration_seconds / 60
+
+            # Account for overlap when calculating optimal chunk duration
+            # Each chunk overlaps by CHUNK_OVERLAP_SECONDS, so effective step size is
+            # chunk_duration - overlap
+            # For memory_safe_workers chunks:
+            # (chunk_duration - overlap) * memory_safe_workers = total_duration
+            # Therefore:
+            # chunk_duration = (total_duration / memory_safe_workers) + overlap
+            optimized_chunk_duration_minutes = (
+                audio_duration_seconds / memory_safe_workers + CHUNK_OVERLAP_SECONDS
+            ) / 60
+
+            # Ensure we don't go below the minimum 2 minutes
+            if optimized_chunk_duration_minutes < 2.0:
+                optimized_chunk_duration_minutes = 2.0
+                # Recalculate actual chunks needed with the minimum duration
+                # using the same logic as create_audio_chunks
+                effective_chunk_seconds = (
+                    optimized_chunk_duration_minutes * 60 - CHUNK_OVERLAP_SECONDS
+                )
+                actual_num_chunks = max(
+                    1, math.ceil(audio_duration_seconds / effective_chunk_seconds)
+                )
+            else:
+                # Perfect case: exactly memory_safe_workers chunks
+                actual_num_chunks = memory_safe_workers
+
+            logger.info(
+                f"Optimizing for {memory_safe_workers} memory-safe workers: "
+                f"{optimized_chunk_duration_minutes:.1f}min chunks "
+                f"({actual_num_chunks} total chunks)"
+            )
+
+            # Create audio chunks with optimized duration
+            chunk_files = create_audio_chunks(trimmed_audio_file, optimized_chunk_duration_minutes)
+            temp_chunk_files = chunk_files.copy()  # Keep track for cleanup
+
+            # Define transcription parameters (only non-defaults)
+            transcribe_params = {
+                "language": language,  # Use detected or specified language
+                "best_of": 2,  # Try multiple attempts and pick best (default: 5)
+                "beam_size": 3,  # Use beam search for better accuracy (default: 5)
+                "patience": 1.0,  # Wait longer for better results (default: None)
+                "verbose": True,  # Show progress (default: False)
+            }
+
+            # Log parameters being used
+            param_summary = ", ".join(
+                f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
+            )
+            logger.info(f"Using parameters: {param_summary}")
+
+            total_chunks = len(chunk_files)
+            num_workers = min(memory_safe_workers, total_chunks)
+
+            logger.info(f"CPU cores detected: {_CPU_CORES}, max workers configured: {max_workers}")
+            logger.info(f"Memory-safe workers: {memory_safe_workers}")
+            logger.info(
+                f"Processing {total_chunks} optimized chunks using "
+                f"{num_workers} processes simultaneously"
+            )
+
+            # Prepare chunk information for parallel processing
+            chunk_tasks = []
+            for i, chunk_file in enumerate(chunk_files):
+                chunk_start_time = i * (
+                    optimized_chunk_duration_minutes * 60 - CHUNK_OVERLAP_SECONDS
+                )
+                if i > 0:  # Add overlap back for timing calculation
+                    chunk_start_time -= CHUNK_OVERLAP_SECONDS
+
+                chunk_info = (i, chunk_file, chunk_start_time, model_size, transcribe_params)
+                chunk_tasks.append(chunk_info)
+
+            # Process chunks in parallel using multiprocessing
+            transcription_process_start = time.time()
+            chunk_results = []
+            completed_chunks = 0
+
+            logger.info(f"🚀 Starting parallel transcription of {total_chunks} chunks...")
+
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all chunk transcription tasks
+                future_to_chunk = {
+                    executor.submit(transcribe_single_chunk, chunk_task): chunk_task[0]
+                    for chunk_task in chunk_tasks
+                }
+
+                logger.info(f"📋 All {total_chunks} tasks submitted to processes")
+
+                # Collect results as they complete
+                for future in as_completed(future_to_chunk):
+                    chunk_index = future_to_chunk[future]
+                    try:
+                        chunk_result = future.result()
+                        chunk_results.append(chunk_result)
+                        completed_chunks += 1
+
+                        # Show real-time progress
+                        elapsed = time.time() - transcription_process_start
+                        logger.info(
+                            f"📊 Progress: {completed_chunks}/{total_chunks} chunks completed "
+                            f"({format_duration(elapsed)} elapsed)"
+                        )
+
+                        if completed_chunks < total_chunks:
+                            remaining = total_chunks - completed_chunks
+                            est_time_per_chunk = elapsed / completed_chunks
+                            est_remaining = est_time_per_chunk * remaining
+                            logger.info(
+                                f"⏱️  Estimated time remaining: {format_duration(est_remaining)}"
+                            )
+
+                    except Exception as e:
+                        logger.error(f"❌ Failed to get result for chunk {chunk_index + 1}: {e}")
+                        # Add empty result to maintain order
+                        chunk_results.append((chunk_index, {"text": "", "segments": []}, 0.0))
+                        completed_chunks += 1
+
+            # Combine results from all chunks
+            if chunk_results:
+                logger.info("🔗 Combining results from all chunks...")
+                result = combine_transcription_segments(chunk_results)
+
+                # Show summary of parallel transcription
+                total_segments = len(result.get("segments", []))
+                total_text_length = len(result.get("text", ""))
+                logger.info(
+                    f"✅ Parallel transcription complete! Combined {total_segments} segments, "
+                    f"{total_text_length} characters"
+                )
+            else:
+                logger.error("❌ No chunks were successfully transcribed")
+                result = {"text": "", "segments": []}
+
+            transcription_process_time = time.time() - transcription_process_start
+
+        else:
+            # Standard single-file transcription
+            model_load_start = time.time()
+            logger.info(f"Loading Whisper model ({model_size})...")
+            logger.info("(This may download the model if not already cached)")
+            model = whisper.load_model(model_size)
+            model_load_time = time.time() - model_load_start
+            logger.info(f"Model loading time: {format_duration(model_load_time)}")
+
+            duration_info = (
+                f" (first {max_duration_minutes} minutes only)" if max_duration_minutes else ""
+            )
+            logger.info(f"Transcribing audio file: {audio_file_path}{duration_info}")
+            logger.info("This may take a few minutes depending on the file size...")
+
+            # Define transcription parameters (only non-defaults)
+            transcribe_params = {
+                "language": language,  # Use detected or specified language
+                "best_of": 2,  # Try multiple attempts and pick best (default: 5)
+                "beam_size": 3,  # Use beam search for better accuracy (default: 5)
+                "patience": 1.0,  # Wait longer for better results (default: None)
+                "verbose": True,  # Show progress (default: False)
+            }
+
+            # Log parameters being used
+            param_summary = ", ".join(
+                f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
+            )
+            logger.info(f"Using parameters: {param_summary}")
+
+            # Transcribe using the silence-trimmed audio file
+            transcription_process_start = time.time()
+            result = model.transcribe(trimmed_audio_file, **transcribe_params)
+            transcription_process_time = time.time() - transcription_process_start
 
         # Extract the transcribed text
         transcribed_text = result["text"]
@@ -671,6 +1244,20 @@ def transcribe_audio(
             f.write("Silence trimming: applied\n")
             f.write("Enhanced format: timing & confidence data included\n")
 
+            # Add chunking information
+            if use_chunking and "temp_chunk_files" in locals():
+                f.write(
+                    f"Streaming transcription: {len(temp_chunk_files)} chunks processed "
+                    f"using {num_workers} processes\n"
+                )
+            else:
+                multiprocessing_status = (
+                    "enabled but not used (single file processing)"
+                    if use_multiprocessing
+                    else "disabled"
+                )
+                f.write(f"Streaming transcription: {multiprocessing_status}\n")
+
             # Add GPT summarization information
             gpt_status = "enabled" if use_gpt_refinement else "disabled"
             f.write(f"{GPT_MODEL_DISPLAY_NAME} summarization: {gpt_status}\n")
@@ -717,6 +1304,16 @@ def transcribe_audio(
             except OSError as e:
                 logger.warning(f"Could not remove temporary file {temp_processed_file}: {e}")
 
+        # Clean up chunk files if they were created
+        if "temp_chunk_files" in locals():
+            for chunk_file in temp_chunk_files:
+                if chunk_file != trimmed_audio_file and os.path.exists(chunk_file):
+                    try:
+                        os.remove(chunk_file)
+                        logger.debug(f"Cleaned up temporary chunk file: {chunk_file}")
+                    except OSError as e:
+                        logger.warning(f"Could not remove temporary chunk file {chunk_file}: {e}")
+
         # Clean up trimmed audio file if it was created and is different from original
         try:
             if (
@@ -745,6 +1342,7 @@ Examples:
   %(prog)s recording.mp4 --description 'Weekly team standup discussing project progress'
   %(prog)s recording.mp4 --language he --description 'Technical discussion about ML models'
   %(prog)s recording.mp4 --max-duration 1 --description 'Quick client call about requirements'
+  %(prog)s recording.mp4 --multiprocessing --max-workers 4  # Enable parallel processing
   %(prog)s recording.mp4 --no-gpt
 
 Supported formats:
@@ -793,6 +1391,27 @@ Requirements:
     )
 
     parser.add_argument(
+        "--multiprocessing",
+        action="store_true",
+        help=(
+            "Enable multiprocessing for large files "
+            "(uses chunked transcription with parallel processing)"
+        ),
+    )
+
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=MAX_PARALLEL_CHUNKS,
+        metavar="N",
+        help=(
+            f"Maximum number of parallel processes to use when multiprocessing is enabled "
+            f"(default: {MAX_PARALLEL_CHUNKS}, auto-detected from CPU cores). "
+            f"Actual count may be limited by available memory."
+        ),
+    )
+
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -807,6 +1426,9 @@ Requirements:
 
     if args.max_duration is not None and args.max_duration <= 0:
         parser.error("--max-duration must be a positive number")
+
+    if args.max_workers <= 0:
+        parser.error("--max-workers must be a positive number")
 
     return args
 
@@ -865,6 +1487,8 @@ def main():
             max_duration_minutes=max_duration_minutes,
             use_gpt_refinement=use_gpt_refinement,
             meeting_description=meeting_description,
+            use_multiprocessing=args.multiprocessing,
+            max_workers=args.max_workers,
         )
 
         overall_time = time.time() - overall_start_time

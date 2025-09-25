@@ -27,7 +27,26 @@
             "args": [
                 "Campaign Features - 2025_08_31 15_32 IDT - Recording.mp4",
                 "--max-duration",
-                "1.0",
+                "30",
+                "--description",
+                "A talk regarding the issues with the campaign_id feature, between Roei and Ido. Roei is the one doing most of the explaining."
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Transcribe Audio - Full File (Multiprocessing)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/transcribe_audio.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/opt/anaconda3/envs/meeting-summarizer/bin/python",
+            "args": [
+                "Campaign Features - 2025_08_31 15_32 IDT - Recording.mp4",
+                "--multiprocessing",
                 "--description",
                 "A talk regarding the issues with the campaign_id feature, between Roei and Ido. Roei is the one doing most of the explaining."
             ],

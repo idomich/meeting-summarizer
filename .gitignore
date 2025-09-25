@@ -27,3 +27,4 @@ cmg.py
 .history
 .vscode/settings.json
 *.mp*
+*_transcription*.txt
