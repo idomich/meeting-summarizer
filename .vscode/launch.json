@@ -27,7 +27,8 @@
             "args": [
                 "Campaign Features - 2025_08_31 15_32 IDT - Recording.mp4",
                 "--max-duration",
-                "30",
+                "10",
+                "--multiprocessing",
                 "--description",
                 "A talk regarding the issues with the campaign_id feature, between Roei and Ido. Roei is the one doing most of the explaining."
             ],

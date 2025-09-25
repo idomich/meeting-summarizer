@@ -3,6 +3,7 @@ import logging
 import math
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -101,16 +102,15 @@ def calculate_safe_process_count(max_requested: int, model_size: str) -> int:
     Returns:
         Safe number of processes that won't exceed available memory
     """
-    available_memory_gb = get_available_memory_gb()
 
     # Estimate memory usage without loading the model
     estimated_memory_gb = estimate_model_memory_usage(model_size)
 
-    # Add safety margin of 0.5GB per process for processing overhead
-    memory_per_process_gb = estimated_memory_gb + 0.5
+    # Multiply by 2 for safety margin
+    memory_per_process_gb = estimated_memory_gb * 2
 
     # Reserve 2GB for the system and main process
-    usable_memory_gb = max(0, available_memory_gb - 2.0)
+    usable_memory_gb = max(0, get_available_memory_gb() - 2.0)
 
     # Calculate how many processes we can safely run
     safe_processes = max(1, int(usable_memory_gb / memory_per_process_gb))
@@ -119,9 +119,9 @@ def calculate_safe_process_count(max_requested: int, model_size: str) -> int:
     final_processes = min(safe_processes, max_requested)
 
     logger.info(
-        f"Memory check: {available_memory_gb:.1f}GB available, "
+        f"Memory check: {usable_memory_gb:.1f}GB usable, "
         f"{memory_per_process_gb:.1f}GB per {model_size} model process "
-        f"(estimated: {estimated_memory_gb:.2f}GB + 0.5GB safety margin)"
+        f"(estimated: {estimated_memory_gb:.2f}GB (x2 safety margin))"
     )
     logger.info(
         f"Safe process limit: {safe_processes}, requested: {max_requested}, "
@@ -432,7 +432,7 @@ def should_use_chunking(audio_file_path: str, max_duration_minutes: float = None
         if file_size_mb >= MIN_FILE_SIZE_FOR_CHUNKING_MB:
             logger.info(
                 f"Large file detected ({format_file_size(os.path.getsize(audio_file_path))}), "
-                "will use chunked transcription"
+                "chunked transcription recommended"
             )
             return True
     except OSError:
@@ -450,7 +450,7 @@ def should_use_chunking(audio_file_path: str, max_duration_minutes: float = None
     if effective_duration_minutes > 4:  # Use chunking for files >4 min to allow 2-minute chunks
         logger.info(
             f"Audio detected ({format_duration(effective_duration_minutes * 60)}), "
-            "will use chunked transcription"
+            "chunked transcription recommended"
         )
         return True
 
@@ -497,6 +497,76 @@ def format_structured_transcription(result: dict) -> str:
             )
 
     return "\n".join(formatted_lines)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def clean_and_translate_transcription_with_gpt(
+    transcription_data, language_detected: str = None
+) -> str:
+    """
+    Clean and translate transcription using GPT-5 to remove uncertainties,
+    correct errors, and translate to English while preserving timestamps
+
+    Args:
+        transcription_data: Either a structured transcription string with timing/confidence
+                          or the raw Whisper result dictionary
+        language_detected: The detected language of the original audio (optional)
+
+    Returns:
+        Cleaned and translated transcription in English with timestamps
+    """
+    client = OpenAI()  # Will use OPENAI_API_KEY environment variable
+
+    # Handle both structured and simple transcription formats
+    if isinstance(transcription_data, dict):
+        # If we get the raw Whisper result, format it with timing/confidence
+        structured_transcription = format_structured_transcription(transcription_data)
+    else:
+        # If we get a pre-formatted string, use it directly
+        structured_transcription = str(transcription_data)
+
+    # Build a concise prompt (minimized instructions to reduce token usage)
+    prompt = (
+        "Translate the following transcription into clear, fluent English. "
+        "Correct obvious errors and remove filler words or uncertainties. "
+        "Preserve all timestamps exactly as they appear and keep technical terms intact. "
+        "Return only the cleaned English transcription.\n\n"
+        f"Transcript:\n{structured_transcription}"
+    )
+
+    start_time = time.time()
+    logger.info(f"Cleaning and translating transcription with {GPT_MODEL_DISPLAY_NAME}...")
+    logger.info("This may take a moment...")
+
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert at cleaning and translating transcriptions. "
+                        "Focus on producing clear, accurate English while preserving "
+                        "timestamps, technical accuracy, and the original structure. "
+                        "Correct errors based on context but do not add new information."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            reasoning_effort="high",
+        )
+
+        cleaned_text = response.choices[0].message.content
+        cleaning_time = time.time() - start_time
+
+        logger.info(f"{GPT_MODEL_DISPLAY_NAME} transcription cleaning completed successfully!")
+        logger.info(f"Cleaning and translation time: {format_duration(cleaning_time)}")
+        return cleaned_text
+
+    except Exception as e:
+        logger.warning(f"{GPT_MODEL_DISPLAY_NAME} transcription cleaning failed: {e}")
+        logger.info("Using original transcription for summarization...")
+        return structured_transcription
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -1007,8 +1077,8 @@ def transcribe_audio(
             trimmed_audio_file, max_duration_minutes
         ):
             logger.info(
-                "Large file detected but multiprocessing is disabled - "
-                "using single-process transcription"
+                "Chunked transcription recommended but multiprocessing is disabled - "
+                "using single-process transcription instead"
             )
             logger.info(
                 "Consider using --multiprocessing flag for faster processing of large files"
@@ -1199,15 +1269,26 @@ def transcribe_audio(
         transcribed_text = result["text"]
         logger.info(f"Whisper transcription time: {format_duration(transcription_process_time)}")
 
-        # Summarize conversation with GPT if enabled
+        # Clean and translate transcription, then summarize with GPT if enabled
+        cleaned_transcription = None
         if use_gpt_refinement:
+            # First, clean and translate the transcription
+            cleaned_transcription = clean_and_translate_transcription_with_gpt(
+                result, language  # Pass full result with segments
+            )
+            # Remove Whisper confidence annotations now that cleaning is complete
+            cleaned_transcription = re.sub(
+                r"\s*\(confidence: [0-9.]+\)", "", cleaned_transcription
+            )
+
+            # Then summarize based on the cleaned transcription
             summary_text = summarize_conversation_with_gpt(
-                result, language, meeting_description  # Pass full result with segments
+                cleaned_transcription, language, meeting_description  # Use cleaned transcription
             )
         else:
             # When not using GPT, still provide structured format for consistency
             summary_text = format_structured_transcription(result)
-            logger.info("Skipping GPT summarization as requested.")
+            logger.info("Skipping GPT cleaning and summarization as requested.")
 
         total_transcription_time = time.time() - transcription_start_time
         logger.info(
@@ -1258,8 +1339,9 @@ def transcribe_audio(
                 )
                 f.write(f"Streaming transcription: {multiprocessing_status}\n")
 
-            # Add GPT summarization information
+            # Add GPT processing information
             gpt_status = "enabled" if use_gpt_refinement else "disabled"
+            f.write(f"{GPT_MODEL_DISPLAY_NAME} cleaning & translation: {gpt_status}\n")
             f.write(f"{GPT_MODEL_DISPLAY_NAME} summarization: {gpt_status}\n")
 
             # Add meeting description if provided
@@ -1272,6 +1354,11 @@ def transcribe_audio(
             if use_gpt_refinement:
                 f.write(f"=== CONVERSATION SUMMARY ({GPT_MODEL_DISPLAY_NAME}) ===\n\n")
                 f.write(summary_text)
+                f.write("\n\n" + "=" * 50 + "\n")
+                f.write(
+                    f"=== CLEANED & TRANSLATED TRANSCRIPTION ({GPT_MODEL_DISPLAY_NAME}) ===\n\n"
+                )
+                f.write(cleaned_transcription)
                 f.write("\n\n" + "=" * 50 + "\n")
                 f.write("=== ORIGINAL TRANSCRIPTION WITH TIMING & CONFIDENCE (Whisper) ===\n\n")
                 f.write(format_structured_transcription(result))
@@ -1341,7 +1428,7 @@ Examples:
   %(prog)s recording.mp4 --model large-v3-turbo
   %(prog)s recording.mp4 --description 'Weekly team standup discussing project progress'
   %(prog)s recording.mp4 --language he --description 'Technical discussion about ML models'
-  %(prog)s recording.mp4 --max-duration 1 --description 'Quick client call about requirements'
+  %(prog)s recording.mp4 --max-duration 10 --description 'Demo: first 10 minutes only'
   %(prog)s recording.mp4 --multiprocessing --max-workers 4  # Enable parallel processing
   %(prog)s recording.mp4 --no-gpt
 
