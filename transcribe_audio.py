@@ -12,18 +12,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import google.generativeai as genai
 import psutil
 import whisper
-from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 DEFAULT_MODEL_SIZE = "large-v3-turbo"
 DEFAULT_DETECTOR_SIZE = "base"
 MIN_LANGUAGE_CONFIDENCE = 0.8
 
-# GPT model configuration
-GPT_MODEL_NAME = "gpt-5"
-GPT_MODEL_DISPLAY_NAME = "GPT-5 (high)"
+# Gemini model configuration
+LLM_MODEL_NAME = "gemini-3-pro-preview"
+LLM_MODEL_DISPLAY_NAME = "Gemini 3 Pro"
 
 # Video file extensions that require conversion
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
@@ -471,7 +471,7 @@ def format_structured_transcription(result: dict) -> str:
         return result.get("text", "")
 
     formatted_lines = []
-    formatted_lines.append("=== STRUCTURED TRANSCRIPTION WITH TIMING & CONFIDENCE ===\n")
+    formatted_lines.append("## Structured Transcription with Timing & Confidence\n")
 
     for segment in result["segments"]:
         start_time = segment.get("start", 0)
@@ -496,15 +496,15 @@ def format_structured_transcription(result: dict) -> str:
                 f"(confidence: {confidence:.2f}) {text}"
             )
 
-    return "\n".join(formatted_lines)
+    return "\n\n".join(formatted_lines)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def clean_and_translate_transcription_with_gpt(
+def clean_and_translate_transcription_with_gemini(
     transcription_data, language_detected: str = None
 ) -> str:
     """
-    Clean and translate transcription using GPT-5 to remove uncertainties,
+    Clean and translate transcription using Gemini to remove uncertainties,
     correct errors, and translate to English while preserving timestamps
 
     Args:
@@ -515,7 +515,9 @@ def clean_and_translate_transcription_with_gpt(
     Returns:
         Cleaned and translated transcription in English with timestamps
     """
-    client = OpenAI()  # Will use OPENAI_API_KEY environment variable
+    # Configure Gemini with API key from environment
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+    model = genai.GenerativeModel(LLM_MODEL_NAME)
 
     # Handle both structured and simple transcription formats
     if isinstance(transcription_data, dict):
@@ -525,8 +527,16 @@ def clean_and_translate_transcription_with_gpt(
         # If we get a pre-formatted string, use it directly
         structured_transcription = str(transcription_data)
 
-    # Build a concise prompt (minimized instructions to reduce token usage)
+    # Build the prompt
+    system_instruction = (
+        "You are an expert at cleaning and translating transcriptions. "
+        "Focus on producing clear, accurate English while preserving "
+        "timestamps, technical accuracy, and the original structure. "
+        "Correct errors based on context but do not add new information."
+    )
+
     prompt = (
+        f"{system_instruction}\n\n"
         "Translate the following transcription into clear, fluent English. "
         "Correct obvious errors and remove filler words or uncertainties. "
         "Preserve all timestamps exactly as they appear and keep technical terms intact. "
@@ -535,46 +545,34 @@ def clean_and_translate_transcription_with_gpt(
     )
 
     start_time = time.time()
-    logger.info(f"Cleaning and translating transcription with {GPT_MODEL_DISPLAY_NAME}...")
+    logger.info(f"Cleaning and translating transcription with {LLM_MODEL_DISPLAY_NAME}...")
     logger.info("This may take a moment...")
 
     try:
-        response = client.chat.completions.create(
-            model=GPT_MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert at cleaning and translating transcriptions. "
-                        "Focus on producing clear, accurate English while preserving "
-                        "timestamps, technical accuracy, and the original structure. "
-                        "Correct errors based on context but do not add new information."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            reasoning_effort="high",
-        )
-
-        cleaned_text = response.choices[0].message.content
+        response = model.generate_content(prompt)
+        cleaned_text = response.text
         cleaning_time = time.time() - start_time
 
-        logger.info(f"{GPT_MODEL_DISPLAY_NAME} transcription cleaning completed successfully!")
+        logger.info(f"{LLM_MODEL_DISPLAY_NAME} transcription cleaning completed successfully!")
         logger.info(f"Cleaning and translation time: {format_duration(cleaning_time)}")
         return cleaned_text
 
     except Exception as e:
-        logger.warning(f"{GPT_MODEL_DISPLAY_NAME} transcription cleaning failed: {e}")
-        logger.info("Using original transcription for summarization...")
-        return structured_transcription
+        logger.error(
+            f"{LLM_MODEL_DISPLAY_NAME} transcription cleaning failed: {type(e).__name__}: {e}"
+        )
+        import traceback
+
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        raise
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def summarize_conversation_with_gpt(
+def summarize_conversation_with_gemini(
     transcription_data, language_detected: str = None, meeting_description: str = None
 ) -> str:
     """
-    Summarize the conversation using GPT-5 to create a detailed summary
+    Summarize the conversation using Gemini to create a detailed summary
     preserving the flow of thinking
 
     Args:
@@ -586,7 +584,9 @@ def summarize_conversation_with_gpt(
     Returns:
         Detailed conversation summary
     """
-    client = OpenAI()  # Will use OPENAI_API_KEY environment variable
+    # Configure Gemini with API key from environment
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+    model = genai.GenerativeModel(LLM_MODEL_NAME)
 
     # Handle both structured and simple transcription formats
     if isinstance(transcription_data, dict):
@@ -629,6 +629,14 @@ def summarize_conversation_with_gpt(
         )
 
     # Summarization instructions
+    system_instruction = (
+        "You are an expert at creating comprehensive summaries of "
+        "conversations and meetings. Focus on preserving all "
+        "important information, technical details, and the logical "
+        "flow of ideas while presenting them in a clear, organized "
+        "manner."
+    )
+
     prompt_header = (
         "You are tasked with creating a comprehensive summary of this "
         "conversation or meeting transcript."
@@ -658,7 +666,9 @@ def summarize_conversation_with_gpt(
     )
 
     # Build the complete prompt
-    prompt = f"""{prompt_header}
+    prompt = f"""{system_instruction}
+
+{prompt_header}
 
 {task_instruction}{meeting_context}{language_context}{timing_context}
 
@@ -668,39 +678,122 @@ Original transcript:
 {output_request}"""
 
     start_time = time.time()
-    logger.info(f"Summarizing conversation with {GPT_MODEL_DISPLAY_NAME}...")
+    logger.info(f"Summarizing conversation with {LLM_MODEL_DISPLAY_NAME}...")
     logger.info("This may take a moment...")
 
     try:
-        response = client.chat.completions.create(
-            model=GPT_MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert at creating comprehensive summaries of "
-                        "conversations and meetings. Focus on preserving all "
-                        "important information, technical details, and the logical "
-                        "flow of ideas while presenting them in a clear, organized "
-                        "manner."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            reasoning_effort="high",
-        )
-
-        summary_text = response.choices[0].message.content
+        response = model.generate_content(prompt)
+        summary_text = response.text
         summarization_time = time.time() - start_time
 
-        logger.info(f"{GPT_MODEL_DISPLAY_NAME} summarization completed successfully!")
+        logger.info(f"{LLM_MODEL_DISPLAY_NAME} summarization completed successfully!")
         logger.info(f"Summarization time: {format_duration(summarization_time)}")
         return summary_text
 
     except Exception as e:
-        logger.warning(f"{GPT_MODEL_DISPLAY_NAME} summarization failed: {e}")
-        logger.info("Returning original transcription...")
-        return structured_transcription
+        logger.error(f"{LLM_MODEL_DISPLAY_NAME} summarization failed: {type(e).__name__}: {e}")
+        import traceback
+
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        raise
+
+
+def extract_transcription_from_file(transcription_file_path: str) -> tuple[str, str, dict]:
+    """
+    Extract the cleaned transcription (or raw transcription) from an existing transcription file.
+
+    Args:
+        transcription_file_path: Path to the existing transcription file
+
+    Returns:
+        Tuple of (transcription_text, original_source_file, metadata_dict)
+    """
+    logger.info(f"Reading existing transcription from: {transcription_file_path}")
+
+    with open(transcription_file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Extract metadata from header (Markdown format with **bold:** labels)
+    metadata = {}
+    lines = content.split("\n")
+    for line in lines[:20]:  # Check first 20 lines for metadata
+        if line.startswith("# Transcription:"):
+            metadata["source_file"] = line.replace("# Transcription:", "").strip()
+        elif line.startswith("# Re-summarized:"):
+            # For re-summarized files, look for Original source
+            pass
+        elif line.startswith("**Original source:**"):
+            metadata["source_file"] = line.replace("**Original source:**", "").strip()
+        elif line.startswith("**Language:**"):
+            metadata["language"] = line.replace("**Language:**", "").strip()
+        elif line.startswith("**Meeting description:**"):
+            metadata["meeting_description"] = line.replace("**Meeting description:**", "").strip()
+
+    # Try to find the cleaned transcription section first (Markdown format)
+    cleaned_marker = "## Cleaned & Translated Transcription"
+    original_marker = "## Original Transcription"
+    structured_marker = "## Structured Transcription"
+
+    transcription_text = None
+
+    # Priority 1: Use cleaned transcription if available
+    if cleaned_marker in content:
+        start_idx = content.find(cleaned_marker)
+        # Find the line after the marker
+        newline_idx = content.find("\n", start_idx)
+        if newline_idx != -1:
+            start_idx = newline_idx + 1
+        # Find the end (next section "## " or "---", or end of file)
+        end_idx = len(content)
+        for end_marker in ["\n## ", "\n---"]:
+            idx = content.find(end_marker, start_idx)
+            if idx != -1 and idx < end_idx:
+                end_idx = idx
+        transcription_text = content[start_idx:end_idx].strip()
+        logger.info("Using cleaned & translated transcription for re-summarization")
+
+    # Priority 2: Use original transcription with timing
+    elif original_marker in content:
+        start_idx = content.find(original_marker)
+        newline_idx = content.find("\n", start_idx)
+        if newline_idx != -1:
+            start_idx = newline_idx + 1
+        end_idx = len(content)
+        for end_marker in ["\n## ", "\n---"]:
+            idx = content.find(end_marker, start_idx)
+            if idx != -1 and idx < end_idx:
+                end_idx = idx
+        transcription_text = content[start_idx:end_idx].strip()
+        logger.info("Using original transcription with timing for re-summarization")
+
+    # Priority 3: Use structured transcription
+    elif structured_marker in content:
+        start_idx = content.find(structured_marker)
+        newline_idx = content.find("\n", start_idx)
+        if newline_idx != -1:
+            start_idx = newline_idx + 1
+        end_idx = len(content)
+        for end_marker in ["\n## ", "\n---"]:
+            idx = content.find(end_marker, start_idx)
+            if idx != -1 and idx < end_idx:
+                end_idx = idx
+        transcription_text = content[start_idx:end_idx].strip()
+        logger.info("Using structured transcription for re-summarization")
+
+    # Fallback: Use everything after the header separator
+    else:
+        separator = "\n---\n"
+        if separator in content:
+            start_idx = content.find(separator) + len(separator)
+            transcription_text = content[start_idx:].strip()
+        else:
+            transcription_text = content
+        logger.info("Using full content for re-summarization (no sections found)")
+
+    source_file = metadata.get("source_file", os.path.basename(transcription_file_path))
+    logger.info(f"Extracted transcription: {len(transcription_text)} characters")
+
+    return transcription_text, source_file, metadata
 
 
 def convert_video_to_audio(
@@ -1273,7 +1366,7 @@ def transcribe_audio(
         cleaned_transcription = None
         if use_gpt_refinement:
             # First, clean and translate the transcription
-            cleaned_transcription = clean_and_translate_transcription_with_gpt(
+            cleaned_transcription = clean_and_translate_transcription_with_gemini(
                 result, language  # Pass full result with segments
             )
             # Remove Whisper confidence annotations now that cleaning is complete
@@ -1282,7 +1375,7 @@ def transcribe_audio(
             )
 
             # Then summarize based on the cleaned transcription
-            summary_text = summarize_conversation_with_gpt(
+            summary_text = summarize_conversation_with_gemini(
                 cleaned_transcription, language, meeting_description  # Use cleaned transcription
             )
         else:
@@ -1302,34 +1395,34 @@ def transcribe_audio(
             base_name = os.path.splitext(source_path)[0]
             # Add timestamp when process ends to prevent overwriting
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file_path = f"{base_name}_transcription_{timestamp}.txt"
+            output_file_path = f"{base_name}_transcription_{timestamp}.md"
 
         # Save transcription to file
         with open(output_file_path, "w", encoding="utf-8") as f:
             # Show original input file in header (useful when video was converted to audio)
             source_file = original_input_file if original_input_file else audio_file_path
-            f.write(f"Transcription of: {os.path.basename(source_file)}\n")
-            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Model used: {model_size}\n")
-            f.write(f"Language: {language}\n")
+            f.write(f"# Transcription: {os.path.basename(source_file)}\n\n")
+            f.write(f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"**Model used:** {model_size}\n\n")
+            f.write(f"**Language:** {language}\n\n")
 
             # Add duration information if limited
             if max_duration_minutes is not None:
-                f.write(f"Duration limit: {max_duration_minutes} minutes\n")
+                f.write(f"**Duration limit:** {max_duration_minutes} minutes\n\n")
 
             # Simple parameter logging
             params_str = ", ".join(
                 f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
             )
-            f.write(f"Parameters: {params_str}\n")
-            f.write("Silence trimming: applied\n")
-            f.write("Enhanced format: timing & confidence data included\n")
+            f.write(f"**Parameters:** `{params_str}`\n\n")
+            f.write("**Silence trimming:** applied\n\n")
+            f.write("**Enhanced format:** timing & confidence data included\n\n")
 
             # Add chunking information
             if use_chunking and "temp_chunk_files" in locals():
                 f.write(
-                    f"Streaming transcription: {len(temp_chunk_files)} chunks processed "
-                    f"using {num_workers} processes\n"
+                    f"**Streaming transcription:** {len(temp_chunk_files)} chunks processed "
+                    f"using {num_workers} processes\n\n"
                 )
             else:
                 multiprocessing_status = (
@@ -1337,30 +1430,28 @@ def transcribe_audio(
                     if use_multiprocessing
                     else "disabled"
                 )
-                f.write(f"Streaming transcription: {multiprocessing_status}\n")
+                f.write(f"**Streaming transcription:** {multiprocessing_status}\n\n")
 
             # Add GPT processing information
             gpt_status = "enabled" if use_gpt_refinement else "disabled"
-            f.write(f"{GPT_MODEL_DISPLAY_NAME} cleaning & translation: {gpt_status}\n")
-            f.write(f"{GPT_MODEL_DISPLAY_NAME} summarization: {gpt_status}\n")
+            f.write(f"**{LLM_MODEL_DISPLAY_NAME} cleaning & translation:** {gpt_status}\n\n")
+            f.write(f"**{LLM_MODEL_DISPLAY_NAME} summarization:** {gpt_status}\n\n")
 
             # Add meeting description if provided
             if meeting_description:
-                f.write(f"Meeting description: {meeting_description}\n")
+                f.write(f"**Meeting description:** {meeting_description}\n\n")
 
-            f.write("=" * 50 + "\n\n")
+            f.write("---\n\n")
 
             # Write summary if GPT was used, otherwise structured transcription
             if use_gpt_refinement:
-                f.write(f"=== CONVERSATION SUMMARY ({GPT_MODEL_DISPLAY_NAME}) ===\n\n")
+                f.write(f"## Conversation Summary ({LLM_MODEL_DISPLAY_NAME})\n\n")
                 f.write(summary_text)
-                f.write("\n\n" + "=" * 50 + "\n")
-                f.write(
-                    f"=== CLEANED & TRANSLATED TRANSCRIPTION ({GPT_MODEL_DISPLAY_NAME}) ===\n\n"
-                )
+                f.write("\n\n---\n\n")
+                f.write(f"## Cleaned & Translated Transcription ({LLM_MODEL_DISPLAY_NAME})\n\n")
                 f.write(cleaned_transcription)
-                f.write("\n\n" + "=" * 50 + "\n")
-                f.write("=== ORIGINAL TRANSCRIPTION WITH TIMING & CONFIDENCE (Whisper) ===\n\n")
+                f.write("\n\n---\n\n")
+                f.write("## Original Transcription with Timing & Confidence (Whisper)\n\n")
                 f.write(format_structured_transcription(result))
             else:
                 f.write(summary_text)  # This is already the structured format
@@ -1431,6 +1522,7 @@ Examples:
   %(prog)s recording.mp4 --max-duration 10 --description 'Demo: first 10 minutes only'
   %(prog)s recording.mp4 --multiprocessing --max-workers 4  # Enable parallel processing
   %(prog)s recording.mp4 --no-gpt
+  %(prog)s dummy --resummarize existing_transcription.txt  # Re-summarize existing file
 
 Supported formats:
   Audio: .mp3, .wav, .flac, .m4a, .aac, .ogg
@@ -1438,7 +1530,7 @@ Supported formats:
 
 Requirements:
   - ffmpeg for video file conversion
-  - OPENAI_API_KEY environment variable for {GPT_MODEL_DISPLAY_NAME} summarization
+  - GEMINI_API_KEY environment variable for {LLM_MODEL_DISPLAY_NAME} summarization
         """,
     )
 
@@ -1470,7 +1562,7 @@ Requirements:
     parser.add_argument(
         "--no-gpt",
         action="store_true",
-        help=f"Disable {GPT_MODEL_DISPLAY_NAME} summarization and use only Whisper transcription",
+        help=f"Disable {LLM_MODEL_DISPLAY_NAME} summarization and use only Whisper transcription",
     )
 
     parser.add_argument(
@@ -1505,10 +1597,23 @@ Requirements:
         help="Set logging level (default: INFO)",
     )
 
+    parser.add_argument(
+        "--resummarize",
+        metavar="TRANSCRIPTION_FILE",
+        help=(
+            "Path to an existing transcription file to re-summarize. "
+            "Skips transcription and only regenerates the summary. "
+            "When used, input_file can be any placeholder."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Validate arguments
-    if not os.path.exists(args.input_file):
+    if args.resummarize:
+        if not os.path.exists(args.resummarize):
+            parser.error(f"Transcription file not found: {args.resummarize}")
+    elif not os.path.exists(args.input_file):
         parser.error(f"Input file not found: {args.input_file}")
 
     if args.max_duration is not None and args.max_duration <= 0:
@@ -1518,6 +1623,78 @@ Requirements:
         parser.error("--max-workers must be a positive number")
 
     return args
+
+
+def resummarize_transcription(
+    transcription_file: str,
+    output_file_path: str = None,
+    meeting_description: str = None,
+) -> tuple[str, str]:
+    """
+    Re-summarize an existing transcription file without re-transcribing.
+
+    Args:
+        transcription_file: Path to existing transcription file
+        output_file_path: Optional output path for new summary
+        meeting_description: Optional meeting description for context
+
+    Returns:
+        Tuple of (summary_text, output_file_path)
+    """
+    start_time = time.time()
+
+    # Extract transcription from existing file
+    transcription_text, source_file, metadata = extract_transcription_from_file(transcription_file)
+
+    # Use meeting description from args, or fall back to metadata
+    if not meeting_description:
+        meeting_description = metadata.get("meeting_description")
+
+    language = metadata.get("language", "en")
+
+    logger.info("Re-summarizing transcription...")
+    logger.info(f"Source: {source_file}")
+    logger.info(f"Language: {language}")
+    if meeting_description:
+        logger.info(f"Meeting description: {meeting_description}")
+
+    # Run summarization
+    summary_text = summarize_conversation_with_gemini(
+        transcription_text, language, meeting_description
+    )
+
+    summarization_time = time.time() - start_time
+
+    # Generate output file path
+    if output_file_path is None:
+        base_name = os.path.splitext(transcription_file)[0]
+        # Remove old timestamp if present
+        base_name = re.sub(r"_transcription_\d{8}_\d{6}$", "", base_name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file_path = f"{base_name}_resummarized_{timestamp}.md"
+
+    # Save the new summary file
+    with open(output_file_path, "w", encoding="utf-8") as f:
+        f.write(f"# Re-summarized: {os.path.basename(transcription_file)}\n\n")
+        f.write(f"**Original source:** {source_file}\n\n")
+        f.write(f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"**Model used:** {LLM_MODEL_DISPLAY_NAME}\n\n")
+        f.write(f"**Language:** {language}\n\n")
+        if meeting_description:
+            f.write(f"**Meeting description:** {meeting_description}\n\n")
+        f.write("---\n\n")
+
+        f.write(f"## Conversation Summary ({LLM_MODEL_DISPLAY_NAME})\n\n")
+        f.write(summary_text)
+        f.write("\n\n---\n\n")
+
+        f.write("## Original Transcription (from source file)\n\n")
+        f.write(transcription_text)
+
+    logger.info(f"Re-summarization completed in {format_duration(summarization_time)}")
+    logger.info(f"Output saved to: {output_file_path}")
+
+    return summary_text, output_file_path
 
 
 def main():
@@ -1545,6 +1722,43 @@ def main():
         logger.error(f"Error parsing arguments: {e}")
         sys.exit(1)
 
+    # Handle --resummarize mode
+    if args.resummarize:
+        try:
+            overall_start_time = time.time()
+            logger.info("=== RE-SUMMARIZATION MODE ===")
+
+            summary_text, actual_output_path = resummarize_transcription(
+                args.resummarize,
+                output_file_path=output_file_path,
+                meeting_description=meeting_description,
+            )
+
+            overall_time = time.time() - overall_start_time
+
+            logger.info(f"Summary length: {len(summary_text)} characters")
+            logger.info("=== PERFORMANCE SUMMARY ===")
+            logger.info(f"Total processing time: {format_duration(overall_time)}")
+            logger.info(f"Input file size: {format_file_size(os.path.getsize(args.resummarize))}")
+            logger.info(
+                f"Output file size: {format_file_size(os.path.getsize(actual_output_path))}"
+            )
+            logger.info(f"Output file: {os.path.basename(actual_output_path)}")
+            logger.info("=============================")
+
+        except KeyboardInterrupt:
+            logger.info("Process interrupted by user")
+            sys.exit(130)
+        except Exception as e:
+            logger.error(f"Error re-summarizing file: {e}")
+            import traceback
+
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            sys.exit(1)
+
+        return  # Exit after resummarize mode
+
+    # Normal transcription mode
     # Determine if input is video or audio
     file_extension = Path(input_file).suffix.lower()
     is_video = file_extension in VIDEO_EXTENSIONS
