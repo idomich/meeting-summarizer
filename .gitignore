@@ -28,3 +28,4 @@ cmg.py
 .vscode/settings.json
 *.mp*
 *_transcription*.txt
+.ralph/*
