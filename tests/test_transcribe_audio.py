@@ -4,9 +4,9 @@ Unit tests for transcribe_audio.py
 
 Tests key functionality including:
 - Utility functions (formatting, timestamps)
-- Prompt building for GPT summarization
+- Prompt building for Claude summarization
 - Error handling and validation
-- Mock tests for external dependencies (OpenAI, Whisper)
+- Mock tests for external dependencies (Claude CLI, Whisper)
 """
 
 import logging
@@ -75,7 +75,7 @@ class TestStructuredTranscription(unittest.TestCase):
         formatted = transcribe_audio.format_structured_transcription(result)
 
         # Should include header
-        self.assertIn("=== STRUCTURED TRANSCRIPTION WITH TIMING & CONFIDENCE ===", formatted)
+        self.assertIn("## Structured Transcription with Timing & Confidence", formatted)
 
         # Should include speaking segment
         self.assertIn("[00:00.00 --> 00:01.00]", formatted)
@@ -88,22 +88,12 @@ class TestStructuredTranscription(unittest.TestCase):
         self.assertIn("confidence:", formatted)
 
 
-class TestGPTSummarization(unittest.TestCase):
-    """Test GPT summarization with mocked OpenAI calls"""
+class TestClaudeSummarization(unittest.TestCase):
+    """Test Claude Code CLI summarization with mocked subprocess calls"""
 
-    @patch("transcribe_audio.OpenAI")
-    def test_summarize_conversation_success(self, mock_openai_class):
-        """Test successful GPT summarization"""
-        # Setup mock
-        mock_client = Mock()
-        mock_openai_class.return_value = mock_client
-
-        mock_response = Mock()
-        mock_response.choices = [Mock()]
-        mock_response.choices[0].message.content = "summary"
-        mock_client.chat.completions.create.return_value = mock_response
-
-        # Minimal test data
+    @patch("transcribe_audio.run_claude_cli_prompt", return_value="summary")
+    def test_summarize_conversation_success(self, mock_run_claude):
+        """Test successful Claude summarization"""
         segment = {
             "start": 0.0,
             "end": 1.0,
@@ -113,84 +103,115 @@ class TestGPTSummarization(unittest.TestCase):
         }
         transcription_data = {"text": "test", "segments": [segment]}
 
-        # Call function
-        result = transcribe_audio.summarize_conversation_with_gpt(
+        result = transcribe_audio.summarize_conversation(
             transcription_data,
-            language_detected="he",  # Use Hebrew to test language context
+            language_detected="he",
             meeting_description="meet",
         )
 
-        # Assertions
         self.assertEqual(result, "summary")
-        mock_client.chat.completions.create.assert_called_once()
+        mock_run_claude.assert_called_once()
+        prompt = mock_run_claude.call_args[0][0]
+        self.assertIn("meet", prompt)
+        self.assertIn("language 'he'", prompt)
+        self.assertIn("timing information", prompt)
 
-        # Check that the call was made with correct parameters
-        call_args = mock_client.chat.completions.create.call_args
-        self.assertEqual(call_args[1]["model"], transcribe_audio.GPT_MODEL_NAME)
-        self.assertEqual(call_args[1]["reasoning_effort"], "high")
+    @patch("transcribe_audio.run_claude_cli_prompt", side_effect=RuntimeError("CLI Error"))
+    def test_summarize_conversation_failure_raises(self, mock_run_claude):
+        """Test that summarization propagates Claude CLI failures after retries"""
+        del mock_run_claude
+        transcription_data = {"text": "test", "segments": []}
 
-        # Check that prompt includes key elements
-        user_message = call_args[1]["messages"][1]["content"]
-        self.assertIn("meet", user_message)
-        self.assertIn("original audio was in language 'he'", user_message)
-        self.assertIn("timing information", user_message)
+        with self.assertRaises(Exception):
+            transcribe_audio.summarize_conversation(transcription_data)
 
-    @patch("transcribe_audio.OpenAI")
-    @patch("transcribe_audio.logger")
-    def test_summarize_conversation_failure_fallback(self, mock_logger, mock_openai_class):
-        """Test that function falls back to structured transcription on API failure"""
-        # Setup mock to raise exception
-        mock_client = Mock()
-        mock_openai_class.return_value = mock_client
-        mock_client.chat.completions.create.side_effect = Exception("API Error")
+    @patch("transcribe_audio.run_claude_cli_prompt", return_value="Summary")
+    def test_prompt_construction_elements(self, mock_run_claude):
+        """Test that Claude prompts contain required elements"""
+        transcribe_audio.summarize_conversation(
+            "Test transcription", language_detected="he", meeting_description="meet"
+        )
 
-        # Minimal test data
-        segment = {
-            "start": 0.0,
-            "end": 1.0,
-            "text": " test",
-            "avg_logprob": -0.3,
-            "no_speech_prob": 0.1,
-        }
-        transcription_data = {"text": "test", "segments": [segment]}
+        prompt = mock_run_claude.call_args[0][0]
+        for element in ("summary", "meet", "language 'he'"):
+            self.assertIn(element, prompt, f"Missing expected element: {element}")
 
-        # Call function
-        result = transcribe_audio.summarize_conversation_with_gpt(transcription_data)
 
-        # Should return formatted structured transcription
-        self.assertIn("=== STRUCTURED TRANSCRIPTION WITH TIMING & CONFIDENCE ===", result)
-        self.assertIn("test", result)
+class TestExtractTranscription(unittest.TestCase):
+    """Test extraction helpers for existing transcription files"""
 
-        # Should log warning
-        mock_logger.warning.assert_called()
+    def test_prefer_whisper_original_over_cleaned(self):
+        content = """# Transcription: meeting.mp4
 
-    def test_prompt_construction_elements(self):
-        """Test that GPT prompts contain required elements"""
-        # This is tested indirectly through the mock above, but we can also test
-        # the prompt construction logic by calling the function and checking
-        # the arguments passed to the OpenAI client
+**Language:** he
 
-        with patch("transcribe_audio.OpenAI") as mock_openai_class:
-            mock_client = Mock()
-            mock_openai_class.return_value = mock_client
+---
 
-            mock_response = Mock()
-            mock_response.choices = [Mock()]
-            mock_response.choices[0].message.content = "Summary"
-            mock_client.chat.completions.create.return_value = mock_response
+## Cleaned & Translated Transcription (Claude Sonnet 5)
 
-            transcribe_audio.summarize_conversation_with_gpt(
-                "Test transcription", language_detected="he", meeting_description="meet"
+cleaned text
+
+## Original Transcription with Timing & Confidence (Whisper)
+
+## Structured Transcription with Timing & Confidence
+
+whisper text
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(content)
+            path = f.name
+
+        try:
+            text, _, _ = transcribe_audio.extract_transcription_from_file(
+                path, prefer_whisper_original=True
             )
+            self.assertIn("whisper text", text)
+            self.assertIn("Structured Transcription", text)
 
-            # Check prompt contains expected elements
-            call_args = mock_client.chat.completions.create.call_args
-            prompt = call_args[1]["messages"][1]["content"]
+            text_default, _, _ = transcribe_audio.extract_transcription_from_file(path)
+            self.assertEqual(text_default, "cleaned text")
+        finally:
+            os.remove(path)
 
-            expected_elements = ["summary", "meet", "language 'he'"]
 
-            for element in expected_elements:
-                self.assertIn(element, prompt, f"Missing expected element: {element}")
+class TestRefineTranscription(unittest.TestCase):
+    """Test re-refine flow with mocked Claude calls"""
+
+    @patch("transcribe_audio.summarize_conversation", return_value="summary")
+    @patch("transcribe_audio.clean_and_translate_transcription", return_value="cleaned")
+    @patch("transcribe_audio.write_transcription_markdown_file")
+    def test_refine_transcription_overwrites_by_default(
+        self, mock_write, mock_clean, mock_summarize
+    ):
+        content = """# Transcription: meeting.mp4
+
+**Model used:** large-v3-turbo
+**Language:** he
+**Parameters:** `language=he, best_of=2`
+**Streaming transcription:** 2 chunks processed using 2 processes
+**Meeting description:** team sync
+
+---
+
+## Original Transcription with Timing & Confidence (Whisper)
+
+whisper body
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(content)
+            path = f.name
+
+        try:
+            summary, output_path = transcribe_audio.refine_transcription(path)
+
+            self.assertEqual(summary, "summary")
+            self.assertEqual(output_path, path)
+            mock_clean.assert_called_once_with("whisper body", "he")
+            mock_summarize.assert_called_once()
+            mock_write.assert_called_once()
+            self.assertEqual(mock_write.call_args.kwargs["whisper_markdown"], "whisper body")
+        finally:
+            os.remove(path)
 
 
 class TestArgumentParsing(unittest.TestCase):
@@ -297,7 +318,7 @@ class TestErrorHandling(unittest.TestCase):
             with patch("builtins.open", mock_open()) as mock_file:
                 with patch("transcribe_audio.os.remove"):  # Mock file cleanup
                     result_text, output_path = transcribe_audio.transcribe_audio(
-                        test_file, use_gpt_refinement=False  # Skip GPT to avoid OpenAI mocking
+                        test_file, use_gpt_refinement=False  # Skip LLM to avoid Claude CLI mocking
                     )
 
                 # Check that key functions were called

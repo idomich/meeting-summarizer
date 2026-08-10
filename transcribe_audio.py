@@ -1,9 +1,11 @@
 import argparse
+import json
 import logging
 import math
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,7 +14,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-import google.generativeai as genai
 import psutil
 import whisper
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -21,12 +22,43 @@ DEFAULT_MODEL_SIZE = "large-v3-turbo"
 DEFAULT_DETECTOR_SIZE = "base"
 MIN_LANGUAGE_CONFIDENCE = 0.8
 
-# Gemini model configuration
-LLM_MODEL_NAME = "gemini-3-pro-preview"
-LLM_MODEL_DISPLAY_NAME = "Gemini 3 Pro"
+# Transcription engines. "whisper" runs the local OpenAI Whisper model;
+# "gemini" sends the audio to the Gemini API and asks for a timestamped
+# transcript in the original spoken language (a drop-in for Whisper's output;
+# the downstream Claude clean/translate + summarize steps are unchanged).
+ENGINE_WHISPER = "whisper"
+ENGINE_GEMINI = "gemini"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-pro"
+# Poll interval while the Gemini File API finishes processing an upload.
+GEMINI_UPLOAD_POLL_SECONDS = 2
+
+# LLM refinement via Claude Code CLI (uses local `claude` auth, same as Ralph)
+LLM_MODEL_NAME = "claude-sonnet-5"
+LLM_MODEL_DISPLAY_NAME = "Claude Sonnet 5"
+
+# System prompt that isolates one-shot LLM calls from the ambient Claude Code
+# context (user/project CLAUDE.md, skills, org instructions, cwd/git status).
+# Without this, the CLI treats these prompts as an agentic coding task and
+# derails (e.g. "I'll check the project's output conventions...") instead of
+# performing the requested text transformation.
+CLAUDE_CLI_ISOLATION_SYSTEM_PROMPT = (
+    "You are a stateless text-processing function. You have no tools and no file "
+    "system access. Never inspect files, run commands, describe a plan, or ask "
+    "questions. Treat the user's message strictly as literal text to transform. "
+    "Output only the requested transformed text and nothing else - no preamble, "
+    "no commentary, no meta-notes about what you did or did not do."
+)
 
 # Video file extensions that require conversion
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
+
+# Canonical audio format for the transcription pipeline. Whisper resamples to
+# 16 kHz mono internally, so producing that format up front (at conversion) and
+# preserving it through every re-encode stage (silence trim, chunking) keeps the
+# intermediate files small without affecting transcription quality.
+AUDIO_SAMPLE_RATE = "16000"  # 16 kHz
+AUDIO_CHANNELS = "1"  # mono
+AUDIO_BITRATE = "64k"  # ample for 16 kHz mono speech
 
 # Chunking configuration for streaming transcription
 MIN_FILE_SIZE_FOR_CHUNKING_MB = 10  # Minimum file size to trigger chunking (MB)
@@ -263,9 +295,11 @@ def create_audio_chunks(
             "-acodec",
             "mp3",
             "-ab",
-            "192k",
+            AUDIO_BITRATE,
             "-ar",
-            "44100",
+            AUDIO_SAMPLE_RATE,
+            "-ac",
+            AUDIO_CHANNELS,
             "-y",  # Overwrite output file
             chunk_path,
         ]
@@ -477,11 +511,10 @@ def format_structured_transcription(result: dict) -> str:
         start_time = segment.get("start", 0)
         end_time = segment.get("end", 0)
         text = segment.get("text", "").strip()
-        avg_logprob = segment.get("avg_logprob", 0)  # Average log probability (confidence)
+        # avg_logprob is Whisper-specific; engines like Gemini don't provide it,
+        # so omit the confidence annotation rather than reporting a fake score.
+        avg_logprob = segment.get("avg_logprob")  # Average log probability (confidence)
         no_speech_prob = segment.get("no_speech_prob", 0)  # Probability of no speech
-
-        # Convert log probability to a more intuitive confidence score (0-1)
-        confidence = min(max(1 + (avg_logprob / 2), 0), 1)  # Rough conversion
 
         # Format timestamp
         def format_timestamp(seconds):
@@ -491,43 +524,248 @@ def format_structured_transcription(result: dict) -> str:
 
         # Only include segments with actual speech content
         if text and no_speech_prob < 0.5:
+            if avg_logprob is not None:
+                # Convert log probability to a more intuitive confidence score (0-1)
+                confidence = min(max(1 + (avg_logprob / 2), 0), 1)  # Rough conversion
+                confidence_str = f"(confidence: {confidence:.2f}) "
+            else:
+                confidence_str = ""
             formatted_lines.append(
                 f"[{format_timestamp(start_time)} --> {format_timestamp(end_time)}] "
-                f"(confidence: {confidence:.2f}) {text}"
+                f"{confidence_str}{text}"
             )
 
     return "\n\n".join(formatted_lines)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def clean_and_translate_transcription_with_gemini(
-    transcription_data, language_detected: str = None
-) -> str:
+def _build_gemini_transcription_prompt(language: str = None) -> str:
+    """Build the prompt asking Gemini for a timestamped, original-language transcript."""
+    language_hint = ""
+    if language:
+        language_hint = (
+            f" The spoken language is expected to be '{language}'; transcribe in that "
+            "language and do not translate."
+        )
+    return (
+        "You are a professional speech-to-text transcription engine. Transcribe the "
+        "attached audio recording completely and verbatim in its ORIGINAL spoken "
+        "language. Do not translate, summarize, or omit anything." + language_hint + " "
+        "Segment the transcript at natural sentence or clause boundaries. For each "
+        "segment provide `start_seconds` and `end_seconds` as offsets from the start of "
+        "the audio, in seconds (numbers, e.g. 12.5), and the verbatim `text`. Preserve "
+        "technical terms, product names, and acronyms exactly as spoken. Return only "
+        "JSON matching the provided schema."
+    )
+
+
+def _gemini_result_from_segments(data: dict, language: str = None) -> dict:
+    """Convert Gemini's JSON response into a Whisper-compatible result dict."""
+    segments = []
+    text_parts = []
+    for seg in data.get("segments", []):
+        seg_text = (seg.get("text") or "").strip()
+        if not seg_text:
+            continue
+        segments.append(
+            {
+                "start": float(seg.get("start_seconds", 0.0) or 0.0),
+                "end": float(seg.get("end_seconds", 0.0) or 0.0),
+                "text": f" {seg_text}",
+            }
+        )
+        text_parts.append(seg_text)
+
+    return {
+        "text": " ".join(text_parts),
+        "segments": segments,
+        "language": data.get("language") or language or "unknown",
+    }
+
+
+def transcribe_with_gemini(
+    audio_file_path: str,
+    language: str = None,
+    model: str = GEMINI_DEFAULT_MODEL,
+) -> dict:
     """
-    Clean and translate transcription using Gemini to remove uncertainties,
-    correct errors, and translate to English while preserving timestamps
+    Transcribe an audio file with the Gemini API as a drop-in for Whisper.
+
+    Uploads the audio via the Gemini File API and asks the model for a timestamped
+    transcript in the original spoken language. Returns a Whisper-compatible result
+    dict ({"text", "segments", "language"}) so the downstream Claude clean/translate
+    and summarization steps run unchanged.
+
+    Requires GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment.
+    """
+    # Imported lazily so the Whisper-only path doesn't require the SDK.
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Gemini engine requires an API key. Set GEMINI_API_KEY (or GOOGLE_API_KEY)."
+        )
+
+    client = genai.Client(api_key=api_key)
+
+    logger.info(f"Uploading audio to Gemini File API: {audio_file_path}")
+    upload_start = time.time()
+    uploaded = client.files.upload(file=audio_file_path)
+
+    # Large media files stay in a PROCESSING state until the server finishes
+    # ingesting them; poll until the file is ACTIVE before generating content.
+    while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
+        time.sleep(GEMINI_UPLOAD_POLL_SECONDS)
+        uploaded = client.files.get(name=uploaded.name)
+
+    if getattr(uploaded.state, "name", str(uploaded.state)) == "FAILED":
+        raise RuntimeError("Gemini failed to process the uploaded audio file")
+
+    logger.info(f"Upload ready in {format_duration(time.time() - upload_start)}")
+
+    segment_schema = types.Schema(
+        type="OBJECT",
+        properties={
+            "start_seconds": types.Schema(type="NUMBER"),
+            "end_seconds": types.Schema(type="NUMBER"),
+            "text": types.Schema(type="STRING"),
+        },
+        required=["start_seconds", "end_seconds", "text"],
+    )
+    response_schema = types.Schema(
+        type="OBJECT",
+        properties={
+            "language": types.Schema(
+                type="STRING",
+                description="BCP-47 / ISO-639-1 code of the detected spoken language",
+            ),
+            "segments": types.Schema(type="ARRAY", items=segment_schema),
+        },
+        required=["language", "segments"],
+    )
+
+    logger.info(f"Transcribing with Gemini ({model})...")
+    logger.info("This may take a moment...")
+    transcribe_start = time.time()
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=[_build_gemini_transcription_prompt(language), uploaded],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+                temperature=0.0,
+            ),
+        )
+    finally:
+        # Best-effort cleanup of the uploaded file (auto-expires after 48h anyway).
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception as cleanup_error:
+            logger.warning(f"Could not delete uploaded Gemini file: {cleanup_error}")
+
+    raw = (response.text or "").strip()
+    if not raw:
+        raise RuntimeError("Gemini returned an empty transcription response")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Gemini returned invalid JSON: {e}") from e
+
+    result = _gemini_result_from_segments(data, language)
+    if not result["segments"]:
+        raise RuntimeError("Gemini transcription produced no usable segments")
+
+    logger.info(
+        f"Gemini transcription completed in {format_duration(time.time() - transcribe_start)}"
+    )
+    logger.info(f"Detected language: {result['language']}, {len(result['segments'])} segments")
+    return result
+
+
+def find_claude_cli() -> str:
+    """Resolve the Claude Code CLI executable."""
+    override = os.environ.get("CLAUDE_CLI_PATH")
+    if override:
+        if os.path.isfile(override):
+            return override
+        raise FileNotFoundError(f"CLAUDE_CLI_PATH does not exist: {override}")
+
+    cli = shutil.which("claude")
+    if not cli:
+        raise FileNotFoundError(
+            "Claude Code CLI not found. Install it and ensure `claude` is on PATH, "
+            "or set CLAUDE_CLI_PATH to the executable."
+        )
+    return cli
+
+
+def run_claude_cli_prompt(prompt: str, *, model: str = LLM_MODEL_NAME) -> str:
+    """Run a one-shot prompt through Claude Code CLI and return plain-text output."""
+    command = [
+        find_claude_cli(),
+        "-p",
+        "--output-format",
+        "text",
+        "--model",
+        model,
+        # Isolate from the ambient Claude Code context so this behaves as a pure
+        # text transform, not an agentic coding session in the current repo:
+        "--setting-sources",
+        "",  # do not load user/project/local settings
+        "--system-prompt",
+        CLAUDE_CLI_ISOLATION_SYSTEM_PROMPT,  # replace the default agent system prompt
+        "--exclude-dynamic-system-prompt-sections",  # drop cwd/env/memory/git context
+        "--tools",
+        "",
+        "--no-session-persistence",
+        "--dangerously-skip-permissions",
+        prompt,
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        # Run outside the project tree so no repo CLAUDE.md/skills are auto-discovered.
+        cwd=tempfile.gettempdir(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"Claude CLI failed (exit {result.returncode})" + (f": {detail}" if detail else "")
+        )
+
+    text = result.stdout.strip()
+    if not text:
+        raise RuntimeError("Claude CLI returned empty output")
+    return text
+
+
+def _structured_transcription_input(transcription_data) -> tuple[str, bool]:
+    if isinstance(transcription_data, dict):
+        return format_structured_transcription(transcription_data), True
+    structured_transcription = str(transcription_data)
+    return structured_transcription, "confidence:" in structured_transcription
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def clean_and_translate_transcription(transcription_data, language_detected: str = None) -> str:
+    """
+    Clean and translate transcription using Claude Code CLI.
 
     Args:
-        transcription_data: Either a structured transcription string with timing/confidence
-                          or the raw Whisper result dictionary
+        transcription_data: Structured transcription string or raw Whisper result dict
         language_detected: The detected language of the original audio (optional)
 
     Returns:
         Cleaned and translated transcription in English with timestamps
     """
-    # Configure Gemini with API key from environment
-    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(LLM_MODEL_NAME)
+    del language_detected  # Reserved for future prompt tuning
+    structured_transcription, _ = _structured_transcription_input(transcription_data)
 
-    # Handle both structured and simple transcription formats
-    if isinstance(transcription_data, dict):
-        # If we get the raw Whisper result, format it with timing/confidence
-        structured_transcription = format_structured_transcription(transcription_data)
-    else:
-        # If we get a pre-formatted string, use it directly
-        structured_transcription = str(transcription_data)
-
-    # Build the prompt
     system_instruction = (
         "You are an expert at cleaning and translating transcriptions. "
         "Focus on producing clear, accurate English while preserving "
@@ -549,8 +787,7 @@ def clean_and_translate_transcription_with_gemini(
     logger.info("This may take a moment...")
 
     try:
-        response = model.generate_content(prompt)
-        cleaned_text = response.text
+        cleaned_text = run_claude_cli_prompt(prompt)
         cleaning_time = time.time() - start_time
 
         logger.info(f"{LLM_MODEL_DISPLAY_NAME} transcription cleaning completed successfully!")
@@ -568,37 +805,22 @@ def clean_and_translate_transcription_with_gemini(
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def summarize_conversation_with_gemini(
+def summarize_conversation(
     transcription_data, language_detected: str = None, meeting_description: str = None
 ) -> str:
     """
-    Summarize the conversation using Gemini to create a detailed summary
-    preserving the flow of thinking
+    Summarize the conversation using Claude Code CLI.
 
     Args:
-        transcription_data: Either a structured transcription string with timing/confidence
-                          or the raw Whisper result dictionary
+        transcription_data: Structured transcription string or raw Whisper result dict
         language_detected: The detected language of the original audio (optional)
         meeting_description: Description of the meeting context (optional)
 
     Returns:
         Detailed conversation summary
     """
-    # Configure Gemini with API key from environment
-    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(LLM_MODEL_NAME)
+    structured_transcription, has_timing_info = _structured_transcription_input(transcription_data)
 
-    # Handle both structured and simple transcription formats
-    if isinstance(transcription_data, dict):
-        # If we get the raw Whisper result, format it with timing/confidence
-        structured_transcription = format_structured_transcription(transcription_data)
-        has_timing_info = True
-    else:
-        # If we get a pre-formatted string, use it directly
-        structured_transcription = str(transcription_data)
-        has_timing_info = "confidence:" in structured_transcription
-
-    # Create meeting context section if description provided
     meeting_context = ""
     if meeting_description:
         meeting_context = (
@@ -607,7 +829,6 @@ def summarize_conversation_with_gemini(
             "acronyms, and subject matter discussed."
         )
 
-    # Language context for non-English audio
     language_context = ""
     if language_detected and language_detected != "en":
         language_context = (
@@ -616,7 +837,6 @@ def summarize_conversation_with_gemini(
             "present due to automatic speech recognition."
         )
 
-    # Timing and confidence context
     timing_context = ""
     if has_timing_info:
         timing_context = (
@@ -628,7 +848,6 @@ def summarize_conversation_with_gemini(
             "- Better preserve the chronological structure of the conversation"
         )
 
-    # Summarization instructions
     system_instruction = (
         "You are an expert at creating comprehensive summaries of "
         "conversations and meetings. Focus on preserving all "
@@ -647,12 +866,12 @@ def summarize_conversation_with_gemini(
         "important details discussed",
         "Preserve the logical flow of thinking and progression of ideas "
         "throughout the conversation",
-        "Maintain all technical details, specific examples, numbers, and " "concrete information",
+        "Maintain all technical details, specific examples, numbers, and concrete information",
         "Identify and attribute speakers by name when context allows",
         "Organize the content logically while preserving the chronological "
         "flow of the discussion",
-        "Focus on substance and ideas rather than conversational style " "or atmosphere",
-        "Ensure no important information or insights are lost from the " "original conversation",
+        "Focus on substance and ideas rather than conversational style or atmosphere",
+        "Ensure no important information or insights are lost from the original conversation",
     ]
 
     task_instruction = (
@@ -665,7 +884,6 @@ def summarize_conversation_with_gemini(
         "organized manner without the conversational style."
     )
 
-    # Build the complete prompt
     prompt = f"""{system_instruction}
 
 {prompt_header}
@@ -682,8 +900,7 @@ Original transcript:
     logger.info("This may take a moment...")
 
     try:
-        response = model.generate_content(prompt)
-        summary_text = response.text
+        summary_text = run_claude_cli_prompt(prompt)
         summarization_time = time.time() - start_time
 
         logger.info(f"{LLM_MODEL_DISPLAY_NAME} summarization completed successfully!")
@@ -698,12 +915,129 @@ Original transcript:
         raise
 
 
-def extract_transcription_from_file(transcription_file_path: str) -> tuple[str, str, dict]:
+def _parse_transcription_metadata(lines: list[str]) -> dict:
+    """Parse metadata fields from a transcription markdown header."""
+    metadata = {}
+    for line in lines[:30]:
+        if line.startswith("# Transcription:"):
+            metadata["source_file"] = line.replace("# Transcription:", "").strip()
+        elif line.startswith("**Original source:**"):
+            metadata["source_file"] = line.replace("**Original source:**", "").strip()
+        elif line.startswith("**Model used:**"):
+            metadata["model_size"] = line.replace("**Model used:**", "").strip()
+        elif line.startswith("**Language:**"):
+            metadata["language"] = line.replace("**Language:**", "").strip()
+        elif line.startswith("**Parameters:**"):
+            raw = line.replace("**Parameters:**", "").strip().strip("`")
+            metadata["parameters"] = raw
+        elif line.startswith("**Duration limit:**"):
+            raw = line.replace("**Duration limit:**", "").replace("minutes", "").strip()
+            try:
+                metadata["max_duration_minutes"] = float(raw)
+            except ValueError:
+                pass
+        elif line.startswith("**Streaming transcription:**"):
+            metadata["streaming_transcription"] = line.replace(
+                "**Streaming transcription:**", ""
+            ).strip()
+        elif line.startswith("**Meeting description:**"):
+            metadata["meeting_description"] = line.replace("**Meeting description:**", "").strip()
+    return metadata
+
+
+def _extract_markdown_section(
+    content: str,
+    marker: str,
+    *,
+    end_markers: tuple[str, ...] | None = None,
+) -> str | None:
+    """Extract body text for a markdown section heading."""
+    if marker not in content:
+        return None
+
+    start_idx = content.find(marker)
+    newline_idx = content.find("\n", start_idx)
+    if newline_idx == -1:
+        return None
+    start_idx = newline_idx + 1
+
+    if end_markers is None:
+        end_markers = (
+            "\n## Conversation Summary",
+            "\n## Cleaned & Translated Transcription",
+            "\n## Original Transcription with Timing & Confidence (Whisper)",
+            "\n## Original Transcription",
+            "\n---",
+        )
+
+    end_idx = len(content)
+    for end_marker in end_markers:
+        idx = content.find(end_marker, start_idx)
+        if idx != -1 and idx < end_idx:
+            end_idx = idx
+
+    section_text = content[start_idx:end_idx].strip()
+    return section_text or None
+
+
+def _whisper_section_marker(content: str) -> str:
+    full_marker = "## Original Transcription with Timing & Confidence (Whisper)"
+    if full_marker in content:
+        return full_marker
+    return "## Original Transcription"
+
+
+def _parse_transcribe_params(params_str: str | None) -> dict:
+    """Parse a Parameters header back into a display dict."""
+    if not params_str:
+        return {"language": "en"}
+
+    params = {}
+    for part in params_str.split(","):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if value.replace(".", "", 1).isdigit():
+            params[key] = float(value) if "." in value else int(value)
+        else:
+            params[key] = value
+    return params
+
+
+def _parse_streaming_metadata(
+    streaming_line: str | None,
+) -> tuple[bool, list | None, int | None, bool]:
+    """Return (use_chunking, chunk_placeholder_list, num_workers, use_multiprocessing)."""
+    if not streaming_line:
+        return False, None, None, False
+
+    if "chunks processed" in streaming_line:
+        match = re.search(r"(\d+) chunks processed using (\d+) processes", streaming_line)
+        if match:
+            num_chunks = int(match.group(1))
+            num_workers = int(match.group(2))
+            return True, [None] * num_chunks, num_workers, True
+
+    if "enabled but not used" in streaming_line:
+        return False, None, None, True
+
+    return False, None, None, False
+
+
+def extract_transcription_from_file(
+    transcription_file_path: str,
+    *,
+    prefer_whisper_original: bool = False,
+) -> tuple[str, str, dict]:
     """
-    Extract the cleaned transcription (or raw transcription) from an existing transcription file.
+    Extract transcription text from an existing transcription file.
 
     Args:
         transcription_file_path: Path to the existing transcription file
+        prefer_whisper_original: When True, prefer the raw Whisper section over cleaned text
 
     Returns:
         Tuple of (transcription_text, original_source_file, metadata_dict)
@@ -713,75 +1047,43 @@ def extract_transcription_from_file(transcription_file_path: str) -> tuple[str, 
     with open(transcription_file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Extract metadata from header (Markdown format with **bold:** labels)
-    metadata = {}
-    lines = content.split("\n")
-    for line in lines[:20]:  # Check first 20 lines for metadata
-        if line.startswith("# Transcription:"):
-            metadata["source_file"] = line.replace("# Transcription:", "").strip()
-        elif line.startswith("# Re-summarized:"):
-            # For re-summarized files, look for Original source
-            pass
-        elif line.startswith("**Original source:**"):
-            metadata["source_file"] = line.replace("**Original source:**", "").strip()
-        elif line.startswith("**Language:**"):
-            metadata["language"] = line.replace("**Language:**", "").strip()
-        elif line.startswith("**Meeting description:**"):
-            metadata["meeting_description"] = line.replace("**Meeting description:**", "").strip()
+    metadata = _parse_transcription_metadata(content.split("\n"))
 
-    # Try to find the cleaned transcription section first (Markdown format)
     cleaned_marker = "## Cleaned & Translated Transcription"
-    original_marker = "## Original Transcription"
+    original_marker = _whisper_section_marker(content)
     structured_marker = "## Structured Transcription"
 
-    transcription_text = None
+    whisper_end_markers = (
+        "\n## Conversation Summary",
+        "\n## Cleaned & Translated Transcription",
+    )
+    cleaned_end_markers = (
+        "\n## Original Transcription with Timing & Confidence (Whisper)",
+        "\n## Original Transcription",
+        "\n## Conversation Summary",
+    )
 
-    # Priority 1: Use cleaned transcription if available
-    if cleaned_marker in content:
-        start_idx = content.find(cleaned_marker)
-        # Find the line after the marker
-        newline_idx = content.find("\n", start_idx)
-        if newline_idx != -1:
-            start_idx = newline_idx + 1
-        # Find the end (next section "## " or "---", or end of file)
-        end_idx = len(content)
-        for end_marker in ["\n## ", "\n---"]:
-            idx = content.find(end_marker, start_idx)
-            if idx != -1 and idx < end_idx:
-                end_idx = idx
-        transcription_text = content[start_idx:end_idx].strip()
-        logger.info("Using cleaned & translated transcription for re-summarization")
-
-    # Priority 2: Use original transcription with timing
-    elif original_marker in content:
-        start_idx = content.find(original_marker)
-        newline_idx = content.find("\n", start_idx)
-        if newline_idx != -1:
-            start_idx = newline_idx + 1
-        end_idx = len(content)
-        for end_marker in ["\n## ", "\n---"]:
-            idx = content.find(end_marker, start_idx)
-            if idx != -1 and idx < end_idx:
-                end_idx = idx
-        transcription_text = content[start_idx:end_idx].strip()
-        logger.info("Using original transcription with timing for re-summarization")
-
-    # Priority 3: Use structured transcription
-    elif structured_marker in content:
-        start_idx = content.find(structured_marker)
-        newline_idx = content.find("\n", start_idx)
-        if newline_idx != -1:
-            start_idx = newline_idx + 1
-        end_idx = len(content)
-        for end_marker in ["\n## ", "\n---"]:
-            idx = content.find(end_marker, start_idx)
-            if idx != -1 and idx < end_idx:
-                end_idx = idx
-        transcription_text = content[start_idx:end_idx].strip()
-        logger.info("Using structured transcription for re-summarization")
-
-    # Fallback: Use everything after the header separator
+    if prefer_whisper_original:
+        section_order = [
+            (original_marker, "original Whisper transcription", whisper_end_markers),
+            (structured_marker, "structured transcription", whisper_end_markers),
+            (cleaned_marker, "cleaned & translated transcription", cleaned_end_markers),
+        ]
     else:
+        section_order = [
+            (cleaned_marker, "cleaned & translated transcription", cleaned_end_markers),
+            (original_marker, "original transcription with timing", whisper_end_markers),
+            (structured_marker, "structured transcription", whisper_end_markers),
+        ]
+
+    transcription_text = None
+    for marker, description, end_markers in section_order:
+        transcription_text = _extract_markdown_section(content, marker, end_markers=end_markers)
+        if transcription_text:
+            logger.info(f"Using {description} from existing file")
+            break
+
+    if transcription_text is None:
         separator = "\n---\n"
         if separator in content:
             start_idx = content.find(separator) + len(separator)
@@ -849,9 +1151,11 @@ def convert_video_to_audio(
             "-acodec",
             "mp3",  # Audio codec
             "-ab",
-            "192k",  # Audio bitrate
+            AUDIO_BITRATE,  # 64 kbps
             "-ar",
-            "44100",  # Audio sample rate
+            AUDIO_SAMPLE_RATE,  # 16 kHz
+            "-ac",
+            AUDIO_CHANNELS,  # mono
             "-y",  # Overwrite output file
             temp_audio_path,
         ]
@@ -983,9 +1287,11 @@ def process_audio_with_duration_limit(
         "-acodec",
         "mp3",  # Audio codec
         "-ab",
-        "192k",  # Audio bitrate
+        AUDIO_BITRATE,  # 64 kbps
         "-ar",
-        "44100",  # Audio sample rate
+        AUDIO_SAMPLE_RATE,  # 16 kHz
+        "-ac",
+        AUDIO_CHANNELS,  # mono
         "-y",  # Overwrite output file
         temp_processed_path,
     ]
@@ -1059,9 +1365,11 @@ def trim_silence_from_audio(audio_file_path: str, temp_dir: str = None) -> str:
         "-acodec",
         "mp3",
         "-ab",
-        "192k",
+        AUDIO_BITRATE,
         "-ar",
-        "44100",
+        AUDIO_SAMPLE_RATE,
+        "-ac",
+        AUDIO_CHANNELS,
         "-y",  # Overwrite output file
         temp_trimmed_path,
     ]
@@ -1089,6 +1397,342 @@ def trim_silence_from_audio(audio_file_path: str, temp_dir: str = None) -> str:
         return audio_file_path
 
 
+def write_transcription_markdown_file(
+    output_file_path: str,
+    *,
+    source_file: str,
+    model_size: str,
+    language: str,
+    max_duration_minutes: float | None,
+    transcribe_params: dict,
+    use_chunking: bool,
+    temp_chunk_files: list | None,
+    num_workers: int | None,
+    use_multiprocessing: bool,
+    use_gpt_refinement: bool,
+    meeting_description: str | None,
+    result: dict,
+    cleaned_transcription: str | None,
+    summary_text: str | None,
+    whisper_markdown: str | None = None,
+    engine: str = ENGINE_WHISPER,
+) -> None:
+    """
+    Write transcription markdown. When use_gpt_refinement is True and both
+    cleaned_transcription and summary_text are None, writes Whisper-only output
+    (LLM sections pending). Otherwise writes the final layout for the given mode.
+    """
+    with open(output_file_path, "w", encoding="utf-8") as f:
+        f.write(f"# Transcription: {os.path.basename(source_file)}\n\n")
+        f.write(f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"**Model used:** {model_size}\n\n")
+        f.write(f"**Language:** {language}\n\n")
+
+        if max_duration_minutes is not None:
+            f.write(f"**Duration limit:** {max_duration_minutes} minutes\n\n")
+
+        params_str = ", ".join(f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose")
+        f.write(f"**Parameters:** `{params_str}`\n\n")
+        f.write(f"**Engine:** {engine}\n\n")
+        if engine == ENGINE_WHISPER:
+            f.write("**Silence trimming:** applied\n\n")
+            f.write("**Enhanced format:** timing & confidence data included\n\n")
+        else:
+            f.write("**Enhanced format:** timing data included\n\n")
+
+        if use_chunking and temp_chunk_files is not None and num_workers is not None:
+            f.write(
+                f"**Streaming transcription:** {len(temp_chunk_files)} chunks processed "
+                f"using {num_workers} processes\n\n"
+            )
+        else:
+            multiprocessing_status = (
+                "enabled but not used (single file processing)"
+                if use_multiprocessing
+                else "disabled"
+            )
+            f.write(f"**Streaming transcription:** {multiprocessing_status}\n\n")
+
+        if use_gpt_refinement:
+            llm_complete = cleaned_transcription is not None and summary_text is not None
+            if llm_complete:
+                gpt_line = "enabled"
+                sum_line = "enabled"
+            else:
+                gpt_line = (
+                    f"pending — raw Whisper saved below; "
+                    f"this file is updated if {LLM_MODEL_DISPLAY_NAME} steps succeed"
+                )
+                sum_line = gpt_line
+        else:
+            gpt_line = "disabled"
+            sum_line = "disabled"
+
+        f.write(f"**{LLM_MODEL_DISPLAY_NAME} cleaning & translation:** {gpt_line}\n\n")
+        f.write(f"**{LLM_MODEL_DISPLAY_NAME} summarization:** {sum_line}\n\n")
+
+        if meeting_description:
+            f.write(f"**Meeting description:** {meeting_description}\n\n")
+
+        f.write("---\n\n")
+
+        whisper_body = (
+            whisper_markdown
+            if whisper_markdown is not None
+            else format_structured_transcription(result)
+        )
+
+        if engine == ENGINE_WHISPER:
+            raw_header = "## Original Transcription with Timing & Confidence (Whisper)"
+        else:
+            raw_header = f"## Original Transcription with Timing ({engine})"
+
+        if use_gpt_refinement and cleaned_transcription is None and summary_text is None:
+            f.write(f"{raw_header}\n\n")
+            f.write(whisper_body)
+        elif use_gpt_refinement:
+            f.write(f"## Conversation Summary ({LLM_MODEL_DISPLAY_NAME})\n\n")
+            f.write(summary_text)
+            f.write("\n\n---\n\n")
+            f.write(f"## Cleaned & Translated Transcription ({LLM_MODEL_DISPLAY_NAME})\n\n")
+            f.write(cleaned_transcription)
+            f.write("\n\n---\n\n")
+            f.write(f"{raw_header}\n\n")
+            f.write(whisper_body)
+        else:
+            f.write(summary_text)
+
+
+def _transcribe_with_whisper(
+    *,
+    audio_file_path: str,
+    actual_audio_file: str,
+    model_size: str,
+    language: str = None,
+    max_duration_minutes: float = None,
+    use_multiprocessing: bool = False,
+    max_workers: int = MAX_PARALLEL_CHUNKS,
+) -> dict:
+    """
+    Run the local Whisper transcription path (language detection, silence
+    trimming, and single-file or chunked/parallel transcription).
+
+    Returns a dict with the keys consumed by ``transcribe_audio``:
+    ``result``, ``language``, ``transcribe_params``, ``use_chunking``,
+    ``transcription_process_time``, ``trimmed_audio_file``, ``temp_chunk_files``,
+    and ``num_workers`` (``num_workers`` is ``None`` unless chunking was used).
+    """
+    # Detect language if not provided (using the processed audio file if duration was limited)
+    if language is None:
+        language, _confidence = detect_audio_language(actual_audio_file)
+    else:
+        logger.info(f"Using specified language: {language}")
+
+    # Apply silence trimming for better accuracy
+    logger.info("Applying audio preprocessing...")
+    trimmed_audio_file = trim_silence_from_audio(actual_audio_file)
+
+    temp_chunk_files: list = []
+    num_workers = None
+
+    # Check if we should use chunking for large files (only when multiprocessing is enabled)
+    use_chunking = use_multiprocessing and should_use_chunking(
+        trimmed_audio_file, max_duration_minutes
+    )
+
+    if not use_multiprocessing and should_use_chunking(trimmed_audio_file, max_duration_minutes):
+        logger.info(
+            "Chunked transcription recommended but multiprocessing is disabled - "
+            "using single-process transcription instead"
+        )
+        logger.info("Consider using --multiprocessing flag for faster processing of large files")
+
+    if use_chunking:
+        logger.info("Using streaming/chunked transcription for large audio file")
+
+        # First, determine memory-safe worker count
+        memory_safe_workers = calculate_safe_process_count(max_workers, model_size)
+
+        # Now optimize chunk size to match the ACTUAL number of workers we can use
+        audio_duration_seconds = get_audio_duration(trimmed_audio_file)
+
+        # Account for overlap when calculating optimal chunk duration
+        # Each chunk overlaps by CHUNK_OVERLAP_SECONDS, so effective step size is
+        # chunk_duration - overlap
+        # For memory_safe_workers chunks:
+        # (chunk_duration - overlap) * memory_safe_workers = total_duration
+        # Therefore:
+        # chunk_duration = (total_duration / memory_safe_workers) + overlap
+        optimized_chunk_duration_minutes = (
+            audio_duration_seconds / memory_safe_workers + CHUNK_OVERLAP_SECONDS
+        ) / 60
+
+        # Ensure we don't go below the minimum 2 minutes
+        if optimized_chunk_duration_minutes < 2.0:
+            optimized_chunk_duration_minutes = 2.0
+            # Recalculate actual chunks needed with the minimum duration
+            # using the same logic as create_audio_chunks
+            effective_chunk_seconds = optimized_chunk_duration_minutes * 60 - CHUNK_OVERLAP_SECONDS
+            actual_num_chunks = max(1, math.ceil(audio_duration_seconds / effective_chunk_seconds))
+        else:
+            # Perfect case: exactly memory_safe_workers chunks
+            actual_num_chunks = memory_safe_workers
+
+        logger.info(
+            f"Optimizing for {memory_safe_workers} memory-safe workers: "
+            f"{optimized_chunk_duration_minutes:.1f}min chunks "
+            f"({actual_num_chunks} total chunks)"
+        )
+
+        # Create audio chunks with optimized duration
+        chunk_files = create_audio_chunks(trimmed_audio_file, optimized_chunk_duration_minutes)
+        temp_chunk_files = chunk_files.copy()  # Keep track for cleanup
+
+        # Define transcription parameters (only non-defaults)
+        transcribe_params = {
+            "language": language,  # Use detected or specified language
+            "best_of": 2,  # Try multiple attempts and pick best (default: 5)
+            "beam_size": 3,  # Use beam search for better accuracy (default: 5)
+            "patience": 1.0,  # Wait longer for better results (default: None)
+            "verbose": True,  # Show progress (default: False)
+        }
+
+        # Log parameters being used
+        param_summary = ", ".join(
+            f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
+        )
+        logger.info(f"Using parameters: {param_summary}")
+
+        total_chunks = len(chunk_files)
+        num_workers = min(memory_safe_workers, total_chunks)
+
+        logger.info(f"CPU cores detected: {_CPU_CORES}, max workers configured: {max_workers}")
+        logger.info(f"Memory-safe workers: {memory_safe_workers}")
+        logger.info(
+            f"Processing {total_chunks} optimized chunks using "
+            f"{num_workers} processes simultaneously"
+        )
+
+        # Prepare chunk information for parallel processing
+        chunk_tasks = []
+        for i, chunk_file in enumerate(chunk_files):
+            chunk_start_time = i * (optimized_chunk_duration_minutes * 60 - CHUNK_OVERLAP_SECONDS)
+            if i > 0:  # Add overlap back for timing calculation
+                chunk_start_time -= CHUNK_OVERLAP_SECONDS
+
+            chunk_info = (i, chunk_file, chunk_start_time, model_size, transcribe_params)
+            chunk_tasks.append(chunk_info)
+
+        # Process chunks in parallel using multiprocessing
+        transcription_process_start = time.time()
+        chunk_results = []
+        completed_chunks = 0
+
+        logger.info(f"🚀 Starting parallel transcription of {total_chunks} chunks...")
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all chunk transcription tasks
+            future_to_chunk = {
+                executor.submit(transcribe_single_chunk, chunk_task): chunk_task[0]
+                for chunk_task in chunk_tasks
+            }
+
+            logger.info(f"📋 All {total_chunks} tasks submitted to processes")
+
+            # Collect results as they complete
+            for future in as_completed(future_to_chunk):
+                chunk_index = future_to_chunk[future]
+                try:
+                    chunk_result = future.result()
+                    chunk_results.append(chunk_result)
+                    completed_chunks += 1
+
+                    # Show real-time progress
+                    elapsed = time.time() - transcription_process_start
+                    logger.info(
+                        f"📊 Progress: {completed_chunks}/{total_chunks} chunks completed "
+                        f"({format_duration(elapsed)} elapsed)"
+                    )
+
+                    if completed_chunks < total_chunks:
+                        remaining = total_chunks - completed_chunks
+                        est_time_per_chunk = elapsed / completed_chunks
+                        est_remaining = est_time_per_chunk * remaining
+                        logger.info(
+                            f"⏱️  Estimated time remaining: {format_duration(est_remaining)}"
+                        )
+
+                except Exception as e:
+                    logger.error(f"❌ Failed to get result for chunk {chunk_index + 1}: {e}")
+                    # Add empty result to maintain order
+                    chunk_results.append((chunk_index, {"text": "", "segments": []}, 0.0))
+                    completed_chunks += 1
+
+        # Combine results from all chunks
+        if chunk_results:
+            logger.info("🔗 Combining results from all chunks...")
+            result = combine_transcription_segments(chunk_results)
+
+            # Show summary of parallel transcription
+            total_segments = len(result.get("segments", []))
+            total_text_length = len(result.get("text", ""))
+            logger.info(
+                f"✅ Parallel transcription complete! Combined {total_segments} segments, "
+                f"{total_text_length} characters"
+            )
+        else:
+            logger.error("❌ No chunks were successfully transcribed")
+            result = {"text": "", "segments": []}
+
+        transcription_process_time = time.time() - transcription_process_start
+
+    else:
+        # Standard single-file transcription
+        model_load_start = time.time()
+        logger.info(f"Loading Whisper model ({model_size})...")
+        logger.info("(This may download the model if not already cached)")
+        model = whisper.load_model(model_size)
+        model_load_time = time.time() - model_load_start
+        logger.info(f"Model loading time: {format_duration(model_load_time)}")
+
+        duration_info = (
+            f" (first {max_duration_minutes} minutes only)" if max_duration_minutes else ""
+        )
+        logger.info(f"Transcribing audio file: {audio_file_path}{duration_info}")
+        logger.info("This may take a few minutes depending on the file size...")
+
+        # Define transcription parameters (only non-defaults)
+        transcribe_params = {
+            "language": language,  # Use detected or specified language
+            "best_of": 2,  # Try multiple attempts and pick best (default: 5)
+            "beam_size": 3,  # Use beam search for better accuracy (default: 5)
+            "patience": 1.0,  # Wait longer for better results (default: None)
+            "verbose": True,  # Show progress (default: False)
+        }
+
+        # Log parameters being used
+        param_summary = ", ".join(
+            f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
+        )
+        logger.info(f"Using parameters: {param_summary}")
+
+        # Transcribe using the silence-trimmed audio file
+        transcription_process_start = time.time()
+        result = model.transcribe(trimmed_audio_file, **transcribe_params)
+        transcription_process_time = time.time() - transcription_process_start
+
+    return {
+        "result": result,
+        "language": language,
+        "transcribe_params": transcribe_params,
+        "use_chunking": use_chunking,
+        "transcription_process_time": transcription_process_time,
+        "trimmed_audio_file": trimmed_audio_file,
+        "temp_chunk_files": temp_chunk_files,
+        "num_workers": num_workers,
+    }
+
+
 def transcribe_audio(
     audio_file_path: str,
     output_file_path: str = None,
@@ -1100,10 +1744,12 @@ def transcribe_audio(
     meeting_description: str = None,
     use_multiprocessing: bool = False,
     max_workers: int = MAX_PARALLEL_CHUNKS,
+    engine: str = ENGINE_WHISPER,
+    gemini_model: str = GEMINI_DEFAULT_MODEL,
 ) -> tuple[str, str]:
     """
-    Transcribe audio file to text using Whisper and optionally create a
-    detailed summary using GPT
+    Transcribe audio file to text using Whisper or the Gemini API and optionally
+    create a detailed summary using Claude Code CLI
 
     Args:
         audio_file_path: Path to the audio file (should be audio format,
@@ -1118,18 +1764,23 @@ def transcribe_audio(
         max_duration_minutes: Optional maximum duration in minutes to
             transcribe
         use_gpt_refinement: Whether to create a summary of the transcription
-            using GPT (default: True)
+            using Claude (default: True)
         meeting_description: Optional description of the meeting context
-            for better GPT summarization
+            for better summarization
         use_multiprocessing: Whether to enable multiprocessing for large files
             (default: False)
         max_workers: Maximum number of parallel processes for chunked transcription
             when multiprocessing is enabled (default: auto-detected from CPU cores, max 8).
             Actual count may be limited by available memory.
+        engine: Transcription engine, "whisper" (local model) or "gemini"
+            (Gemini API). Gemini ignores the Whisper-specific chunking,
+            silence-trimming, and multiprocessing options.
+        gemini_model: Gemini model name to use when engine="gemini"
+            (default: gemini-2.5-pro).
 
     Returns:
         Tuple of (transcribed_text, output_file_path) where transcribed_text
-        is summarized with GPT if enabled
+        is summarized with Claude if enabled
     """
 
     # Check if audio file exists
@@ -1150,223 +1801,94 @@ def transcribe_audio(
     try:
         transcription_start_time = time.time()
 
-        # Detect language if not provided (using the processed audio file if duration was limited)
-        if language is None:
-            language, confidence = detect_audio_language(actual_audio_file)
+        if engine == ENGINE_GEMINI:
+            # Gemini transcribes the whole file natively (no local model, no
+            # silence trimming, no chunking) and returns Whisper-compatible
+            # segments so the downstream Claude steps are unchanged.
+            logger.info(f"Using Gemini API for transcription (model: {gemini_model})")
+            if language:
+                logger.info(f"Language hint: {language}")
+            model_size = gemini_model
+            use_chunking = False
+            transcription_process_start = time.time()
+            result = transcribe_with_gemini(
+                actual_audio_file, language=language, model=gemini_model
+            )
+            transcription_process_time = time.time() - transcription_process_start
+            language = result.get("language") or language or "unknown"
+            transcribe_params = {"engine": ENGINE_GEMINI, "model": gemini_model}
+            transcribed_text = result["text"]
+            logger.info(
+                f"Gemini transcription time: {format_duration(transcription_process_time)}"
+            )
+            temp_chunk_files = []
         else:
-            logger.info(f"Using specified language: {language}")
-            confidence = None
-
-        # Apply silence trimming for better accuracy
-        logger.info("Applying audio preprocessing...")
-        trimmed_audio_file = trim_silence_from_audio(actual_audio_file)
-
-        # Check if we should use chunking for large files (only when multiprocessing is enabled)
-        use_chunking = use_multiprocessing and should_use_chunking(
-            trimmed_audio_file, max_duration_minutes
-        )
-
-        if not use_multiprocessing and should_use_chunking(
-            trimmed_audio_file, max_duration_minutes
-        ):
-            logger.info(
-                "Chunked transcription recommended but multiprocessing is disabled - "
-                "using single-process transcription instead"
+            whisper_transcription_result = _transcribe_with_whisper(
+                audio_file_path=audio_file_path,
+                actual_audio_file=actual_audio_file,
+                model_size=model_size,
+                language=language,
+                max_duration_minutes=max_duration_minutes,
+                use_multiprocessing=use_multiprocessing,
+                max_workers=max_workers,
             )
+            result = whisper_transcription_result["result"]
+            language = whisper_transcription_result["language"]
+            transcribe_params = whisper_transcription_result["transcribe_params"]
+            use_chunking = whisper_transcription_result["use_chunking"]
+            transcription_process_time = whisper_transcription_result["transcription_process_time"]
+            trimmed_audio_file = whisper_transcription_result["trimmed_audio_file"]
+            temp_chunk_files = whisper_transcription_result["temp_chunk_files"]
+            num_workers = whisper_transcription_result["num_workers"]
+            transcribed_text = result["text"]
             logger.info(
-                "Consider using --multiprocessing flag for faster processing of large files"
+                f"Whisper transcription time: {format_duration(transcription_process_time)}"
             )
 
+        # Resolve output path early so Whisper output can be persisted before optional LLM steps
+        if output_file_path is None:
+            source_path = original_input_file if original_input_file else audio_file_path
+            base_name = os.path.splitext(source_path)[0]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file_path = f"{base_name}_transcription_{timestamp}.md"
+
+        source_file = original_input_file if original_input_file else audio_file_path
         if use_chunking:
-            logger.info("Using streaming/chunked transcription for large audio file")
-
-            # First, determine memory-safe worker count
-            memory_safe_workers = calculate_safe_process_count(max_workers, model_size)
-
-            # Now optimize chunk size to match the ACTUAL number of workers we can use
-            audio_duration_seconds = get_audio_duration(trimmed_audio_file)
-            audio_duration_minutes = audio_duration_seconds / 60
-
-            # Account for overlap when calculating optimal chunk duration
-            # Each chunk overlaps by CHUNK_OVERLAP_SECONDS, so effective step size is
-            # chunk_duration - overlap
-            # For memory_safe_workers chunks:
-            # (chunk_duration - overlap) * memory_safe_workers = total_duration
-            # Therefore:
-            # chunk_duration = (total_duration / memory_safe_workers) + overlap
-            optimized_chunk_duration_minutes = (
-                audio_duration_seconds / memory_safe_workers + CHUNK_OVERLAP_SECONDS
-            ) / 60
-
-            # Ensure we don't go below the minimum 2 minutes
-            if optimized_chunk_duration_minutes < 2.0:
-                optimized_chunk_duration_minutes = 2.0
-                # Recalculate actual chunks needed with the minimum duration
-                # using the same logic as create_audio_chunks
-                effective_chunk_seconds = (
-                    optimized_chunk_duration_minutes * 60 - CHUNK_OVERLAP_SECONDS
-                )
-                actual_num_chunks = max(
-                    1, math.ceil(audio_duration_seconds / effective_chunk_seconds)
-                )
-            else:
-                # Perfect case: exactly memory_safe_workers chunks
-                actual_num_chunks = memory_safe_workers
-
-            logger.info(
-                f"Optimizing for {memory_safe_workers} memory-safe workers: "
-                f"{optimized_chunk_duration_minutes:.1f}min chunks "
-                f"({actual_num_chunks} total chunks)"
-            )
-
-            # Create audio chunks with optimized duration
-            chunk_files = create_audio_chunks(trimmed_audio_file, optimized_chunk_duration_minutes)
-            temp_chunk_files = chunk_files.copy()  # Keep track for cleanup
-
-            # Define transcription parameters (only non-defaults)
-            transcribe_params = {
-                "language": language,  # Use detected or specified language
-                "best_of": 2,  # Try multiple attempts and pick best (default: 5)
-                "beam_size": 3,  # Use beam search for better accuracy (default: 5)
-                "patience": 1.0,  # Wait longer for better results (default: None)
-                "verbose": True,  # Show progress (default: False)
-            }
-
-            # Log parameters being used
-            param_summary = ", ".join(
-                f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
-            )
-            logger.info(f"Using parameters: {param_summary}")
-
-            total_chunks = len(chunk_files)
-            num_workers = min(memory_safe_workers, total_chunks)
-
-            logger.info(f"CPU cores detected: {_CPU_CORES}, max workers configured: {max_workers}")
-            logger.info(f"Memory-safe workers: {memory_safe_workers}")
-            logger.info(
-                f"Processing {total_chunks} optimized chunks using "
-                f"{num_workers} processes simultaneously"
-            )
-
-            # Prepare chunk information for parallel processing
-            chunk_tasks = []
-            for i, chunk_file in enumerate(chunk_files):
-                chunk_start_time = i * (
-                    optimized_chunk_duration_minutes * 60 - CHUNK_OVERLAP_SECONDS
-                )
-                if i > 0:  # Add overlap back for timing calculation
-                    chunk_start_time -= CHUNK_OVERLAP_SECONDS
-
-                chunk_info = (i, chunk_file, chunk_start_time, model_size, transcribe_params)
-                chunk_tasks.append(chunk_info)
-
-            # Process chunks in parallel using multiprocessing
-            transcription_process_start = time.time()
-            chunk_results = []
-            completed_chunks = 0
-
-            logger.info(f"🚀 Starting parallel transcription of {total_chunks} chunks...")
-
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                # Submit all chunk transcription tasks
-                future_to_chunk = {
-                    executor.submit(transcribe_single_chunk, chunk_task): chunk_task[0]
-                    for chunk_task in chunk_tasks
-                }
-
-                logger.info(f"📋 All {total_chunks} tasks submitted to processes")
-
-                # Collect results as they complete
-                for future in as_completed(future_to_chunk):
-                    chunk_index = future_to_chunk[future]
-                    try:
-                        chunk_result = future.result()
-                        chunk_results.append(chunk_result)
-                        completed_chunks += 1
-
-                        # Show real-time progress
-                        elapsed = time.time() - transcription_process_start
-                        logger.info(
-                            f"📊 Progress: {completed_chunks}/{total_chunks} chunks completed "
-                            f"({format_duration(elapsed)} elapsed)"
-                        )
-
-                        if completed_chunks < total_chunks:
-                            remaining = total_chunks - completed_chunks
-                            est_time_per_chunk = elapsed / completed_chunks
-                            est_remaining = est_time_per_chunk * remaining
-                            logger.info(
-                                f"⏱️  Estimated time remaining: {format_duration(est_remaining)}"
-                            )
-
-                    except Exception as e:
-                        logger.error(f"❌ Failed to get result for chunk {chunk_index + 1}: {e}")
-                        # Add empty result to maintain order
-                        chunk_results.append((chunk_index, {"text": "", "segments": []}, 0.0))
-                        completed_chunks += 1
-
-            # Combine results from all chunks
-            if chunk_results:
-                logger.info("🔗 Combining results from all chunks...")
-                result = combine_transcription_segments(chunk_results)
-
-                # Show summary of parallel transcription
-                total_segments = len(result.get("segments", []))
-                total_text_length = len(result.get("text", ""))
-                logger.info(
-                    f"✅ Parallel transcription complete! Combined {total_segments} segments, "
-                    f"{total_text_length} characters"
-                )
-            else:
-                logger.error("❌ No chunks were successfully transcribed")
-                result = {"text": "", "segments": []}
-
-            transcription_process_time = time.time() - transcription_process_start
-
+            _chunk_files = temp_chunk_files
+            _num_workers = num_workers
         else:
-            # Standard single-file transcription
-            model_load_start = time.time()
-            logger.info(f"Loading Whisper model ({model_size})...")
-            logger.info("(This may download the model if not already cached)")
-            model = whisper.load_model(model_size)
-            model_load_time = time.time() - model_load_start
-            logger.info(f"Model loading time: {format_duration(model_load_time)}")
+            _chunk_files = None
+            _num_workers = None
 
-            duration_info = (
-                f" (first {max_duration_minutes} minutes only)" if max_duration_minutes else ""
+        if use_gpt_refinement:
+            write_transcription_markdown_file(
+                output_file_path,
+                source_file=source_file,
+                model_size=model_size,
+                language=language,
+                max_duration_minutes=max_duration_minutes,
+                transcribe_params=transcribe_params,
+                use_chunking=use_chunking,
+                temp_chunk_files=_chunk_files,
+                num_workers=_num_workers,
+                use_multiprocessing=use_multiprocessing,
+                use_gpt_refinement=True,
+                meeting_description=meeting_description,
+                result=result,
+                cleaned_transcription=None,
+                summary_text=None,
+                engine=engine,
             )
-            logger.info(f"Transcribing audio file: {audio_file_path}{duration_info}")
-            logger.info("This may take a few minutes depending on the file size...")
-
-            # Define transcription parameters (only non-defaults)
-            transcribe_params = {
-                "language": language,  # Use detected or specified language
-                "best_of": 2,  # Try multiple attempts and pick best (default: 5)
-                "beam_size": 3,  # Use beam search for better accuracy (default: 5)
-                "patience": 1.0,  # Wait longer for better results (default: None)
-                "verbose": True,  # Show progress (default: False)
-            }
-
-            # Log parameters being used
-            param_summary = ", ".join(
-                f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
+            logger.info(
+                f"{engine.capitalize()} output saved to: {output_file_path} "
+                f"({LLM_MODEL_DISPLAY_NAME} refinement will follow)"
             )
-            logger.info(f"Using parameters: {param_summary}")
 
-            # Transcribe using the silence-trimmed audio file
-            transcription_process_start = time.time()
-            result = model.transcribe(trimmed_audio_file, **transcribe_params)
-            transcription_process_time = time.time() - transcription_process_start
-
-        # Extract the transcribed text
-        transcribed_text = result["text"]
-        logger.info(f"Whisper transcription time: {format_duration(transcription_process_time)}")
-
-        # Clean and translate transcription, then summarize with GPT if enabled
+        # Clean and translate transcription, then summarize with Claude if enabled
         cleaned_transcription = None
         if use_gpt_refinement:
             # First, clean and translate the transcription
-            cleaned_transcription = clean_and_translate_transcription_with_gemini(
+            cleaned_transcription = clean_and_translate_transcription(
                 result, language  # Pass full result with segments
             )
             # Remove Whisper confidence annotations now that cleaning is complete
@@ -1375,86 +1897,38 @@ def transcribe_audio(
             )
 
             # Then summarize based on the cleaned transcription
-            summary_text = summarize_conversation_with_gemini(
+            summary_text = summarize_conversation(
                 cleaned_transcription, language, meeting_description  # Use cleaned transcription
             )
         else:
-            # When not using GPT, still provide structured format for consistency
+            # When not using LLM refinement, still provide structured format for consistency
             summary_text = format_structured_transcription(result)
-            logger.info("Skipping GPT cleaning and summarization as requested.")
+            logger.info("Skipping Claude cleaning and summarization as requested.")
 
         total_transcription_time = time.time() - transcription_start_time
         logger.info(
             f"Total transcription processing time: {format_duration(total_transcription_time)}"
         )
 
-        # Determine output file path with timestamp to avoid overwriting
-        if output_file_path is None:
-            # Use original input file if available, otherwise use audio file path
-            source_path = original_input_file if original_input_file else audio_file_path
-            base_name = os.path.splitext(source_path)[0]
-            # Add timestamp when process ends to prevent overwriting
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file_path = f"{base_name}_transcription_{timestamp}.md"
-
-        # Save transcription to file
-        with open(output_file_path, "w", encoding="utf-8") as f:
-            # Show original input file in header (useful when video was converted to audio)
-            source_file = original_input_file if original_input_file else audio_file_path
-            f.write(f"# Transcription: {os.path.basename(source_file)}\n\n")
-            f.write(f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write(f"**Model used:** {model_size}\n\n")
-            f.write(f"**Language:** {language}\n\n")
-
-            # Add duration information if limited
-            if max_duration_minutes is not None:
-                f.write(f"**Duration limit:** {max_duration_minutes} minutes\n\n")
-
-            # Simple parameter logging
-            params_str = ", ".join(
-                f"{k}={v}" for k, v in transcribe_params.items() if k != "verbose"
-            )
-            f.write(f"**Parameters:** `{params_str}`\n\n")
-            f.write("**Silence trimming:** applied\n\n")
-            f.write("**Enhanced format:** timing & confidence data included\n\n")
-
-            # Add chunking information
-            if use_chunking and "temp_chunk_files" in locals():
-                f.write(
-                    f"**Streaming transcription:** {len(temp_chunk_files)} chunks processed "
-                    f"using {num_workers} processes\n\n"
-                )
-            else:
-                multiprocessing_status = (
-                    "enabled but not used (single file processing)"
-                    if use_multiprocessing
-                    else "disabled"
-                )
-                f.write(f"**Streaming transcription:** {multiprocessing_status}\n\n")
-
-            # Add GPT processing information
-            gpt_status = "enabled" if use_gpt_refinement else "disabled"
-            f.write(f"**{LLM_MODEL_DISPLAY_NAME} cleaning & translation:** {gpt_status}\n\n")
-            f.write(f"**{LLM_MODEL_DISPLAY_NAME} summarization:** {gpt_status}\n\n")
-
-            # Add meeting description if provided
-            if meeting_description:
-                f.write(f"**Meeting description:** {meeting_description}\n\n")
-
-            f.write("---\n\n")
-
-            # Write summary if GPT was used, otherwise structured transcription
-            if use_gpt_refinement:
-                f.write(f"## Conversation Summary ({LLM_MODEL_DISPLAY_NAME})\n\n")
-                f.write(summary_text)
-                f.write("\n\n---\n\n")
-                f.write(f"## Cleaned & Translated Transcription ({LLM_MODEL_DISPLAY_NAME})\n\n")
-                f.write(cleaned_transcription)
-                f.write("\n\n---\n\n")
-                f.write("## Original Transcription with Timing & Confidence (Whisper)\n\n")
-                f.write(format_structured_transcription(result))
-            else:
-                f.write(summary_text)  # This is already the structured format
+        # Save final markdown (overwrites the Whisper-only file when LLM refinement ran)
+        write_transcription_markdown_file(
+            output_file_path,
+            source_file=source_file,
+            model_size=model_size,
+            language=language,
+            max_duration_minutes=max_duration_minutes,
+            transcribe_params=transcribe_params,
+            use_chunking=use_chunking,
+            temp_chunk_files=_chunk_files,
+            num_workers=_num_workers,
+            use_multiprocessing=use_multiprocessing,
+            use_gpt_refinement=use_gpt_refinement,
+            meeting_description=meeting_description,
+            result=result,
+            cleaned_transcription=cleaned_transcription if use_gpt_refinement else None,
+            summary_text=summary_text,
+            engine=engine,
+        )
 
         logger.info("Processing completed!")
         logger.info(f"Output saved to: {output_file_path}")
@@ -1463,7 +1937,7 @@ def transcribe_audio(
         output_file_size = os.path.getsize(output_file_path)
         logger.info(f"Output file size: {format_file_size(output_file_size)}")
 
-        # Show preview of final result (summary if GPT was used)
+        # Show preview of final result (summary if LLM refinement was used)
         final_text = summary_text
         if use_gpt_refinement:
             logger.info("Final summary preview (first 200 characters):")
@@ -1511,7 +1985,10 @@ def transcribe_audio(
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments using argparse"""
     parser = argparse.ArgumentParser(
-        description="Transcribe audio/video files using Whisper and summarize with GPT",
+        description=(
+            "Transcribe audio/video files using Whisper or the Gemini API "
+            "and summarize with the Claude Code CLI"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Examples:
@@ -1521,8 +1998,11 @@ Examples:
   %(prog)s recording.mp4 --language he --description 'Technical discussion about ML models'
   %(prog)s recording.mp4 --max-duration 10 --description 'Demo: first 10 minutes only'
   %(prog)s recording.mp4 --multiprocessing --max-workers 4  # Enable parallel processing
+  %(prog)s recording.mp4 --engine gemini  # Transcribe with the Gemini API instead of Whisper
+  %(prog)s recording.mp4 --engine gemini --gemini-model gemini-2.5-flash
   %(prog)s recording.mp4 --no-gpt
   %(prog)s dummy --resummarize existing_transcription.txt  # Re-summarize existing file
+  %(prog)s dummy --re-refine existing_transcription.md  # Clean/translate + summarize a file
 
 Supported formats:
   Audio: .mp3, .wav, .flac, .m4a, .aac, .ogg
@@ -1530,7 +2010,8 @@ Supported formats:
 
 Requirements:
   - ffmpeg for video file conversion
-  - GEMINI_API_KEY environment variable for {LLM_MODEL_DISPLAY_NAME} summarization
+  - Claude Code CLI (`claude`) on PATH for {LLM_MODEL_DISPLAY_NAME} refinement
+  - GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment for `--engine gemini`
         """,
     )
 
@@ -1545,6 +2026,23 @@ Requirements:
     )
 
     parser.add_argument(
+        "--engine",
+        choices=[ENGINE_WHISPER, ENGINE_GEMINI],
+        default=ENGINE_WHISPER,
+        help=(
+            f"Transcription engine (default: {ENGINE_WHISPER}). "
+            f"'{ENGINE_GEMINI}' sends the audio to the Gemini API instead of the local "
+            "Whisper model (requires GEMINI_API_KEY or GOOGLE_API_KEY)."
+        ),
+    )
+
+    parser.add_argument(
+        "--gemini-model",
+        default=GEMINI_DEFAULT_MODEL,
+        help=f"Gemini model to use when --engine gemini (default: {GEMINI_DEFAULT_MODEL})",
+    )
+
+    parser.add_argument(
         "--language", help="Language code (e.g., 'he', 'en', 'fr') to skip auto-detection"
     )
 
@@ -1556,13 +2054,13 @@ Requirements:
     )
 
     parser.add_argument(
-        "--description", help="Meeting description for better GPT summarization context"
+        "--description", help="Meeting description for better summarization context"
     )
 
     parser.add_argument(
         "--no-gpt",
         action="store_true",
-        help=f"Disable {LLM_MODEL_DISPLAY_NAME} summarization and use only Whisper transcription",
+        help=f"Disable {LLM_MODEL_DISPLAY_NAME} refinement and use only Whisper transcription",
     )
 
     parser.add_argument(
@@ -1607,12 +2105,26 @@ Requirements:
         ),
     )
 
+    parser.add_argument(
+        "--re-refine",
+        metavar="TRANSCRIPTION_FILE",
+        help=(
+            "Path to an existing transcription file to clean, translate, and summarize. "
+            "Uses the raw Whisper section and skips re-transcription. "
+            "When used, input_file can be any placeholder."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Validate arguments
-    if args.resummarize:
-        if not os.path.exists(args.resummarize):
-            parser.error(f"Transcription file not found: {args.resummarize}")
+    if args.resummarize and args.re_refine:
+        parser.error("Cannot use both --resummarize and --re-refine")
+
+    post_process_file = args.resummarize or args.re_refine
+    if post_process_file:
+        if not os.path.exists(post_process_file):
+            parser.error(f"Transcription file not found: {post_process_file}")
     elif not os.path.exists(args.input_file):
         parser.error(f"Input file not found: {args.input_file}")
 
@@ -1659,9 +2171,7 @@ def resummarize_transcription(
         logger.info(f"Meeting description: {meeting_description}")
 
     # Run summarization
-    summary_text = summarize_conversation_with_gemini(
-        transcription_text, language, meeting_description
-    )
+    summary_text = summarize_conversation(transcription_text, language, meeting_description)
 
     summarization_time = time.time() - start_time
 
@@ -1697,6 +2207,78 @@ def resummarize_transcription(
     return summary_text, output_file_path
 
 
+def refine_transcription(
+    transcription_file: str,
+    output_file_path: str | None = None,
+    meeting_description: str | None = None,
+) -> tuple[str, str]:
+    """
+    Run Claude clean/translate and summarization on an existing Whisper transcription file.
+
+    Args:
+        transcription_file: Path to existing transcription markdown
+        output_file_path: Optional output path (defaults to overwriting the input file)
+        meeting_description: Optional meeting description override
+
+    Returns:
+        Tuple of (summary_text, output_file_path)
+    """
+    start_time = time.time()
+
+    whisper_text, source_file, metadata = extract_transcription_from_file(
+        transcription_file, prefer_whisper_original=True
+    )
+
+    if not meeting_description:
+        meeting_description = metadata.get("meeting_description")
+
+    language = metadata.get("language", "en")
+    model_size = metadata.get("model_size", DEFAULT_MODEL_SIZE)
+    max_duration_minutes = metadata.get("max_duration_minutes")
+    transcribe_params = _parse_transcribe_params(metadata.get("parameters"))
+    use_chunking, chunk_files, num_workers, use_multiprocessing = _parse_streaming_metadata(
+        metadata.get("streaming_transcription")
+    )
+
+    logger.info("Re-refining transcription with Claude...")
+    logger.info(f"Source: {source_file}")
+    logger.info(f"Language: {language}")
+    if meeting_description:
+        logger.info(f"Meeting description: {meeting_description}")
+
+    cleaned_transcription = clean_and_translate_transcription(whisper_text, language)
+    cleaned_transcription = re.sub(r"\s*\(confidence: [0-9.]+\)", "", cleaned_transcription)
+    summary_text = summarize_conversation(cleaned_transcription, language, meeting_description)
+
+    if output_file_path is None:
+        output_file_path = transcription_file
+
+    write_transcription_markdown_file(
+        output_file_path,
+        source_file=metadata.get("source_file", source_file),
+        model_size=model_size,
+        language=language,
+        max_duration_minutes=max_duration_minutes,
+        transcribe_params=transcribe_params,
+        use_chunking=use_chunking,
+        temp_chunk_files=chunk_files,
+        num_workers=num_workers,
+        use_multiprocessing=use_multiprocessing,
+        use_gpt_refinement=True,
+        meeting_description=meeting_description,
+        result={},
+        cleaned_transcription=cleaned_transcription,
+        summary_text=summary_text,
+        whisper_markdown=whisper_text,
+    )
+
+    refine_time = time.time() - start_time
+    logger.info(f"Re-refinement completed in {format_duration(refine_time)}")
+    logger.info(f"Output saved to: {output_file_path}")
+
+    return summary_text, output_file_path
+
+
 def main():
     """Main entry point with improved error handling and logging"""
     try:
@@ -1709,6 +2291,8 @@ def main():
 
         input_file = args.input_file
         model_size = args.model
+        engine = args.engine
+        gemini_model = args.gemini_model
         language = args.language
         max_duration_minutes = args.max_duration
         use_gpt_refinement = not args.no_gpt
@@ -1758,6 +2342,42 @@ def main():
 
         return  # Exit after resummarize mode
 
+    # Handle --re-refine mode
+    if args.re_refine:
+        try:
+            overall_start_time = time.time()
+            logger.info("=== RE-REFINEMENT MODE ===")
+
+            summary_text, actual_output_path = refine_transcription(
+                args.re_refine,
+                output_file_path=output_file_path,
+                meeting_description=meeting_description,
+            )
+
+            overall_time = time.time() - overall_start_time
+
+            logger.info(f"Summary length: {len(summary_text)} characters")
+            logger.info("=== PERFORMANCE SUMMARY ===")
+            logger.info(f"Total processing time: {format_duration(overall_time)}")
+            logger.info(f"Input file size: {format_file_size(os.path.getsize(args.re_refine))}")
+            logger.info(
+                f"Output file size: {format_file_size(os.path.getsize(actual_output_path))}"
+            )
+            logger.info(f"Output file: {os.path.basename(actual_output_path)}")
+            logger.info("=============================")
+
+        except KeyboardInterrupt:
+            logger.info("Process interrupted by user")
+            sys.exit(130)
+        except Exception as e:
+            logger.error(f"Error re-refining file: {e}")
+            import traceback
+
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            sys.exit(1)
+
+        return  # Exit after re-refine mode
+
     # Normal transcription mode
     # Determine if input is video or audio
     file_extension = Path(input_file).suffix.lower()
@@ -1790,6 +2410,8 @@ def main():
             meeting_description=meeting_description,
             use_multiprocessing=args.multiprocessing,
             max_workers=args.max_workers,
+            engine=engine,
+            gemini_model=gemini_model,
         )
 
         overall_time = time.time() - overall_start_time
