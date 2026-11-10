@@ -1,11 +1,12 @@
 ---
 name: transcribe-recording
 description: >-
-  Run the meeting-summarizer transcription pipeline on an audio or video recording.
-  Use this whenever the user provides a path to a media file (.mp4, .mov, .mkv, .webm,
-  .m4v, .avi, .wmv, .flv, .mp3, .wav, .m4a, .flac, .aac, .ogg) in this repo, or asks to
-  "transcribe", "summarize", or "run the process" on a recording, meeting, call, or video —
-  even if they only paste a filename with no other instruction. It converts the media to
+  Run the meeting-summarizer transcription pipeline on an audio or video recording, from any
+  repo or session. Use this whenever the user provides a path to a media file (.mp4, .mov, .mkv,
+  .webm, .m4v, .avi, .wmv, .flv, .mp3, .wav, .m4a, .flac, .aac, .ogg), pastes a Google Drive
+  link to a meeting recording, or asks to "transcribe", "summarize", or "run the process" on a
+  recording, meeting, call, or video — even if they only paste a filename or link with no other
+  instruction, and even when the current working directory is another repo. It converts the media to
   audio, transcribes it with Whisper (local) or the Gemini API, and produces a cleaned
   English translation plus a structured summary via the `claude` CLI, saved as a Markdown
   file next to the input. Use the Gemini engine (`--engine gemini`) whenever the user asks
@@ -14,9 +15,25 @@ description: >-
 
 # Transcribe a recording
 
-This repo transcribes and summarizes audio/video meetings. The single entrypoint is
+The meeting-summarizer repo (`/Users/ido.michealovich/Documents/GitHub/meeting-summarizer`)
+transcribes and summarizes audio/video meetings. The single entrypoint is
 `transcribe_audio.py`. Your job when a user hands over a media file is to run it correctly,
 in the background, and report the result.
+
+This skill is global (symlinked into `~/.claude/skills/` from that repo), so the session may be
+in another repo. Always `cd` into the meeting-summarizer repo in the same command that runs the
+script; recordings and their outputs live in that repo's root.
+
+## Input from a Google Drive link
+
+1. Read the file id from the URL (`/file/d/<id>/view`) and fetch its metadata with
+   `mcp__claude_ai_Google_Drive__get_file_metadata` (`excludeContentSnippets: true`) for the
+   title, MIME type and size.
+2. Download it with `mcp__google-workspace__get_drive_file_download_url` (`file_id`). It saves to
+   `~/.workspace-mcp/attachments/` under the title with a UUID suffix and no extension.
+3. `mv` it into the repo root as `<title>.<ext>`, replacing `/` in the title with `_`, and with
+   the extension taken from the MIME type (`video/mp4` → `.mp4`, `audio/mpeg` → `.mp3`).
+   The output Markdown lands next to it.
 
 ## The command
 
@@ -24,7 +41,8 @@ Always run through the project's conda interpreter — a bare `python` will not 
 `torch`, etc. installed:
 
 ```bash
-/opt/anaconda3/envs/meeting-summarizer/bin/python transcribe_audio.py "<path-to-file>"
+cd /Users/ido.michealovich/Documents/GitHub/meeting-summarizer && \
+  /opt/anaconda3/envs/meeting-summarizer/bin/python transcribe_audio.py "<path-to-file>"
 ```
 
 Quote the path — recording filenames routinely contain spaces and parentheses
@@ -36,7 +54,8 @@ Run it in the **background** and redirect output to a log. Transcription is the 
 ### Useful flags (add only when the user asks)
 
 - `--engine gemini` — transcribe with the Gemini API instead of the local Whisper model.
-  Use this whenever the user asks for Gemini / "use Gemini instead of Whisper". It uploads the
+  Use this only when the user asks for Gemini / "use Gemini instead of Whisper": it sends the
+  audio of an internal meeting to an external API, while Whisper keeps it local. It uploads the
   audio to Gemini and returns a timestamped transcript in the original language; the `claude`
   clean/translate + summarize steps still run on top (Gemini replaces only stage 3). Requires
   `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in the environment — if it's unset the run fails fast
